@@ -2,14 +2,78 @@ use crate::agent;
 use crate::config::{self, Config, Paths, StepKind};
 use crate::db::{self, Db, Task};
 use crate::integrations as ix;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
-/// Review step prints this line to request another execution iteration.
-const REWORK: &str = "DEV-LOOP-VERDICT: REWORK";
 const SOURCES: [&str; 4] = ["jira", "github", "gitlab", "file"];
+
+#[derive(Deserialize, Serialize, Clone, Copy, PartialEq, Debug)]
+#[serde(rename_all = "lowercase")]
+enum Severity {
+    Blocker,
+    Major,
+    Minor,
+    Nit,
+}
+
+#[derive(Deserialize, Serialize, Clone, Copy, PartialEq, Debug)]
+#[serde(rename_all = "lowercase")]
+enum Status {
+    Open,
+    Fixed,
+    Wontfix,
+    Closed,
+}
+
+/// Written by each review step. Development sets `status` and `reply`. The review closes or reopens it.
+#[derive(Deserialize, Serialize, Clone, Debug)]
+struct Finding {
+    id: String,
+    severity: Severity,
+    #[serde(default)]
+    file: String,
+    #[serde(default)]
+    line: Option<u32>,
+    problem: String,
+    fix: String,
+    status: Status,
+    #[serde(default)]
+    reply: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct Findings {
+    findings: Vec<Finding>,
+}
+
+impl Finding {
+    /// Blocker or major finding not yet closed by the review step. Blocks the task.
+    fn blocks(&self) -> bool {
+        matches!(self.severity, Severity::Blocker | Severity::Major) && self.status != Status::Closed
+    }
+}
+
+fn read_findings(path: &Path) -> Result<Findings, String> {
+    let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    serde_json::from_str(&text).map_err(|e| format!("{}: invalid findings: {e}", path.display()))
+}
+
+/// Feedback for development: blocking findings only, with the file to update.
+fn feedback(path: &Path, found: &Findings) -> String {
+    let mut s = format!(
+        "Fix each finding below. Then set its `status` to `fixed` or `wontfix` and add a `reply` in {}.\n",
+        path.display()
+    );
+    for f in found.findings.iter().filter(|f| f.blocks()) {
+        let line = f.line.map(|l| format!(":{l}")).unwrap_or_default();
+        s += &format!("- {} [{:?}] {}{line}: {}. Fix: {}\n", f.id, f.severity, f.file, f.problem, f.fix);
+    }
+    s
+}
 
 fn field<'a>(req: &'a Value, key: &str) -> Result<&'a str, String> {
     req[key].as_str().ok_or_else(|| format!("missing `{key}`"))
@@ -159,7 +223,16 @@ fn run(p: &Paths, id: &str) -> Result<(), String> {
             .as_deref()
             .ok_or_else(|| format!("step `{}` has no skill", t.step))?;
         let output_str = output.as_ref().map(|o| o.to_string_lossy().into_owned());
-        let prompt = build_prompt(&t, &key, output_str.as_deref(), step.kind == StepKind::Review);
+        // Review output is removed before the run, so a stale file cannot pass the output check.
+        let previous = match &output {
+            Some(file) if step.kind == StepKind::Review && file.is_file() => {
+                let text = fs::read_to_string(file).map_err(|e| e.to_string())?;
+                fs::remove_file(file).map_err(|e| e.to_string())?;
+                Some(text)
+            }
+            _ => None,
+        };
+        let prompt = build_prompt(&t, &key, output_str.as_deref(), step.kind == StepKind::Review, previous.as_deref());
         let remaining = (limit - t.loop_elapsed) as u64;
         let out = agent::run(&cfg, &prompt, Some(skill), &wt, Duration::from_secs(remaining))?;
 
@@ -183,12 +256,18 @@ fn run(p: &Paths, id: &str) -> Result<(), String> {
         }
 
         t.review_note = None;
-        if step.kind == StepKind::Review && out.text.contains(REWORK) {
-            t.iteration += 1;
-            t.step = lp.steps[0].clone();
-            t.review_note = Some(out.text);
-            db.save(&t)?;
-            continue;
+        if let (StepKind::Review, Some(file)) = (step.kind, &output) {
+            let found = match read_findings(file) {
+                Ok(f) => f,
+                Err(e) => return halt(&db, &cfg, &t, "failed", &e),
+            };
+            if found.findings.iter().any(Finding::blocks) {
+                t.iteration += 1;
+                t.step = lp.steps[0].clone();
+                t.review_note = Some(feedback(file, &found));
+                db.save(&t)?;
+                continue;
+            }
         }
         if advance(&cfg, &mut t)? {
             let msg = match ix::create_pr(&cfg, &wt, &branch(id)) {
@@ -244,7 +323,7 @@ fn key(t: &Task) -> String {
         .collect()
 }
 
-fn build_prompt(t: &Task, key: &str, output: Option<&str>, review: bool) -> String {
+fn build_prompt(t: &Task, key: &str, output: Option<&str>, review: bool, previous: Option<&str>) -> String {
     let mut s = format!("Task key: {key}\nProject: {}\n", t.project);
     if let Some(issue) = &t.issue {
         s += &format!("Issue reference: {issue}\n");
@@ -256,8 +335,11 @@ fn build_prompt(t: &Task, key: &str, output: Option<&str>, review: bool) -> Stri
     if let Some(o) = output {
         s += &format!("\nWrite the output document to: {o}\n");
     }
+    if let Some(prev) = previous {
+        s += &format!("\nPrevious findings. Keep each id. Set status to `closed` when fixed, `open` when not fixed. Add new findings with new ids:\n{prev}\n");
+    }
     if review {
-        s += &format!("\nEnd your reply with the line `{REWORK}` if rework is needed. Otherwise end with `DEV-LOOP-VERDICT: PASS`.\n");
+        s += "\nWrite findings as JSON to the output file: {\"findings\": [{\"id\", \"severity\": \"blocker|major|minor|nit\", \"file\", \"line\", \"problem\", \"fix\", \"status\": \"open\"}]}. Blocker and major block the change. Minor and nit do not. Report only problems that development can fix by changing code in this task's worktree, with skills and tools development has.\n";
     }
     s
 }
@@ -307,7 +389,7 @@ mod tests {
         assert!(!advance(&cfg, &mut t).unwrap());
         assert_eq!((t.loop_name.as_str(), t.step.as_str(), t.iteration, t.loop_elapsed), ("execution", "development", 1, 0));
 
-        for next in ["code-review", "rules-review", "simplification-review"] {
+        for next in ["code-review", "rules-review", "complexity-review", "qa-review"] {
             assert!(!advance(&cfg, &mut t).unwrap());
             assert_eq!(t.step, next);
         }
@@ -321,21 +403,35 @@ mod tests {
     }
 
     #[test]
-    fn build_prompt_includes_request_feedback_output_and_verdict() {
+    fn build_prompt_includes_request_feedback_output_and_findings() {
         let mut t = Task::new("proj", Some("PROJ-1"), None, "add login", "research");
         t.review_note = Some("fix tests".into());
-        let p = build_prompt(&t, "PROJ-1", Some("/docs/x.md"), true);
+        let p = build_prompt(&t, "PROJ-1", Some("/docs/x.md"), true, Some("{\"findings\":[]}"));
         assert!(p.contains("Task key: PROJ-1\nProject: proj\n"));
         assert!(p.contains("Issue reference: PROJ-1"));
         assert!(p.contains("Original request:\nadd login"));
         assert!(p.contains("Feedback to address:\nfix tests"));
         assert!(p.contains("Write the output document to: /docs/x.md"));
-        assert!(p.contains(REWORK));
+        assert!(p.contains("Write findings as JSON"));
+        assert!(p.contains("Previous findings"));
 
-        let plain = build_prompt(&Task::new("proj", None, None, "r", "research"), "k", None, false);
+        let plain = build_prompt(&Task::new("proj", None, None, "r", "research"), "k", None, false, None);
         assert!(!plain.contains("Issue reference"));
-        assert!(!plain.contains(REWORK));
+        assert!(!plain.contains("Write findings as JSON"));
         assert!(!plain.contains("Write the output document"));
+    }
+
+    #[test]
+    fn only_open_blocker_or_major_blocks() {
+        let f = |sev: &str, status: &str| {
+            let text = format!(r#"{{"findings":[{{"id":"1","severity":"{sev}","problem":"p","fix":"f","status":"{status}"}}]}}"#);
+            serde_json::from_str::<Findings>(&text).unwrap().findings.iter().any(Finding::blocks)
+        };
+        assert!(f("blocker", "open"));
+        assert!(f("major", "fixed"));
+        assert!(!f("blocker", "closed"));
+        assert!(!f("minor", "open"));
+        assert!(!f("nit", "open"));
     }
 
     #[test]

@@ -27,16 +27,25 @@ label = "in-progress"
 [steps.code-review]
 kind = "review"
 skill = "code-review"
+output = "<KEY>-code-review.json"
 label = "in-review"
 
 [steps.rules-review]
 kind = "review"
 skill = "rules-review"
+output = "<KEY>-rules-review.json"
 label = "in-review"
 
-[steps.simplification-review]
+[steps.complexity-review]
 kind = "review"
-skill = "simplification-review"
+skill = "complexity-review"
+output = "<KEY>-complexity-review.json"
+label = "in-review"
+
+[steps.qa-review]
+kind = "review"
+skill = "qa-review"
+output = "<KEY>-qa-review.json"
 label = "in-review"
 
 [loops.definition]
@@ -45,7 +54,7 @@ iterations = 3
 time_limit = "1h"
 
 [loops.execution]
-steps = ["development", "code-review", "rules-review", "simplification-review"]
+steps = ["development", "code-review", "rules-review", "complexity-review", "qa-review"]
 iterations = 3
 time_limit = "1h"
 

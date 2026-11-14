@@ -43,7 +43,7 @@ Task created
   -> Execution loop:  development -> code-review -> rules-review -> simplification-review
 ```
 
-A rejected user review restarts the Definition loop. Each review step can request another execution iteration.
+A rejected user review restarts the Definition loop. Each review step writes a findings JSON file. Open `blocker` or `major` findings send the task back to development. Development answers each finding with `fixed` or `wontfix`. The review closes it or reopens it. `minor` and `nit` findings never block.
 
 ## Usage
 
