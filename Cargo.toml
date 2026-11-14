@@ -1,0 +1,13 @@
+[workspace]
+resolver = "3"
+members = ["crates/dev-loop", "crates/dev-loop-ctl"]
+
+[workspace.package]
+authors = ["Pawel Chomicki <pawel.chomicki@gmail.com>"]
+repository = "https://github.com/pchomik/dev-loop"
+version = "0.1.0"
+license = "MIT"
+edition = "2024"
+rust-version = "1.85"
+keywords = ["agent", "orchestrator", "development", "automation", "ai"]
+categories = ["development-tools"]

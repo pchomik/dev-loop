@@ -1,0 +1,71 @@
+# Built-in defaults. User (~/.config/dev-loop/config.toml) and project (dev-loop.toml) values override these.
+
+[agent]
+kind = "pi"
+pi_path = "pi"
+cursor_path = "cursor-agent"
+
+[steps.research]
+skill = "create-research"
+output = "<KEY>-research.md"
+label = "in-research"
+
+[steps.frd]
+skill = "create-frd"
+output = "<KEY>-frd.md"
+label = "in-research"
+
+[steps.user-review]
+kind = "user-review"
+label = "user-review"
+
+[steps.development]
+skill = "development"
+output = "<KEY>-change-record.md"
+label = "in-progress"
+
+[steps.code-review]
+kind = "review"
+skill = "code-review"
+label = "in-review"
+
+[steps.rules-review]
+kind = "review"
+skill = "rules-review"
+label = "in-review"
+
+[steps.simplification-review]
+kind = "review"
+skill = "simplification-review"
+label = "in-review"
+
+[loops.definition]
+steps = ["research", "frd", "user-review"]
+iterations = 3
+time_limit = "1h"
+
+[loops.execution]
+steps = ["development", "code-review", "rules-review", "simplification-review"]
+iterations = 3
+time_limit = "1h"
+
+[github]
+enabled = false
+gh_path = "gh"
+auto_create_pr = false
+
+[gitlab]
+enabled = false
+glab_path = "glab"
+auto_create_mr = false
+
+[telegram]
+enabled = false
+token = ""
+chat_id = ""
+
+[markdown]
+dir = ".features"      # folder for <KEY>/ documents, relative to the repo root
+repo = ""              # empty: task worktree. Path to another git repo (relative to project dir or absolute)
+auto_commit = false
+auto_push = false
