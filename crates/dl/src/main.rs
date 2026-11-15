@@ -91,31 +91,75 @@ fn run(cmd: Cmd) -> Result<(), String> {
         }
         Cmd::List { id } | Cmd::Ls { id } => {
             let tasks = send(json!({ "cmd": "list", "id": id.unwrap_or_default() }))?;
-            for t in tasks.as_array().into_iter().flatten() {
-                print_task(t);
+            if let Some(arr) = tasks.as_array() {
+                print_tasks(arr);
             }
         }
     }
     Ok(())
 }
 
-fn print_task(t: &Value) {
-    let s = |k: &str| t[k].as_str().unwrap_or("-").to_string();
-    println!(
-        "{}  {:<16} {:<10} {:<12} {}/{} #{}  ${:.4}  {}",
-        s("id"),
-        s("status"),
-        s("path"),
-        s("issue"),
-        s("loop_name"),
-        s("step"),
-        t["iteration"],
-        t["cost"].as_f64().unwrap_or(0.0),
-        s("short_description"),
-    );
-    if let Some(m) = t["message"].as_str() {
-        println!("    ! {m}");
+fn print_tasks(tasks: &[Value]) {
+    for line in format_tasks(tasks) {
+        println!("{line}");
     }
+}
+
+fn format_tasks(tasks: &[Value]) -> Vec<String> {
+    if tasks.is_empty() {
+        return Vec::new();
+    }
+
+    const COLS: &[(&str, &str)] = &[
+        ("id", "id"),
+        ("status", "status"),
+        ("path", "path"),
+        ("issue", "issue"),
+        ("loop_name", "loop"),
+        ("step", "step"),
+        ("iteration", "iter"),
+        ("cost", "cost"),
+        ("short_description", "desc"),
+    ];
+
+    let s = |t: &Value, k: &str| t[k].as_str().unwrap_or("-").to_string();
+    let cell = |t: &Value, i: usize| -> String {
+        let (k, _) = COLS[i];
+        match k {
+            "iteration" => t["iteration"].to_string(),
+            "cost" => format!("${:.4}", t["cost"].as_f64().unwrap_or(0.0)),
+            _ => s(t, k),
+        }
+    };
+
+    let col_count = COLS.len();
+    let mut widths = vec![0usize; col_count];
+    for i in 0..col_count {
+        widths[i] = COLS[i].1.len();
+    }
+    for t in tasks {
+        for (i, width) in widths.iter_mut().enumerate() {
+            *width = (*width).max(cell(t, i).len());
+        }
+    }
+
+    let mut lines = Vec::new();
+    let mut parts = Vec::with_capacity(col_count);
+    for i in 0..col_count {
+        parts.push(format!("{:<width$}", COLS[i].1, width = widths[i]));
+    }
+    lines.push(parts.join("  "));
+    for t in tasks {
+        parts.clear();
+        for (i, width) in widths.iter().enumerate() {
+            parts.push(format!("{:<width$}", cell(t, i), width = *width));
+        }
+        lines.push(parts.join("  "));
+        if let Some(m) = t["message"].as_str() {
+            lines.push(format!("    ! {m}"));
+        }
+    }
+    lines
 }
 
 fn home() -> PathBuf {
@@ -216,5 +260,58 @@ mod tests {
         daemon.join().unwrap();
         assert_eq!(resp, json!({ "ok": true, "data": { "cmd": "list" } }));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn format_tasks_aligns_columns() {
+        let tasks = vec![
+            json!({
+                "id": "1", "status": "new", "path": "/a", "issue": null,
+                "loop_name": "definition", "step": "research", "iteration": 1,
+                "cost": 0.0, "short_description": "First"
+            }),
+            json!({
+                "id": "12", "status": "running", "path": "/abc", "issue": "PROJ-1",
+                "loop_name": "execution", "step": "development", "iteration": 2,
+                "cost": 0.1234, "short_description": "Second task"
+            }),
+        ];
+        let lines = format_tasks(&tasks);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "id  status   path  issue   loop        step         iter  cost     desc       ");
+        let header = &lines[0];
+        let row1 = &lines[1];
+        let row2 = &lines[2];
+        assert!(header.starts_with("id"));
+        assert!(row1.starts_with("1   new"));
+        assert!(row2.starts_with("12  running"));
+        for line in &lines {
+            assert!(!line.starts_with("─"));
+            assert!(!line.starts_with("┌"));
+            assert!(!line.starts_with("┐"));
+            assert!(!line.starts_with("├"));
+            assert!(!line.starts_with("┤"));
+            assert!(!line.starts_with("└"));
+            assert!(!line.starts_with("┘"));
+            assert!(!line.starts_with("+"));
+            assert!(!line.starts_with("-"));
+            assert!(!line.starts_with("="));
+        }
+    }
+
+    #[test]
+    fn format_tasks_shows_message() {
+        let tasks = vec![
+            json!({
+                "id": "1", "status": "new", "path": "/a", "issue": null,
+                "loop_name": "definition", "step": "research", "iteration": 1,
+                "cost": 0.0, "short_description": "First",
+                "message": "needs attention"
+            }),
+        ];
+        let lines = format_tasks(&tasks);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "id  status  path  issue  loop        step      iter  cost     desc ");
+        assert_eq!(lines[2], "    ! needs attention");
     }
 }
