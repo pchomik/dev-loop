@@ -79,25 +79,36 @@ fn field<'a>(req: &'a Value, key: &str) -> Result<&'a str, String> {
     req[key].as_str().ok_or_else(|| format!("missing `{key}`"))
 }
 
-fn project_dir(p: &Paths, name: &str) -> Result<PathBuf, String> {
-    config::load(p, None)?
-        .projects
-        .get(name)
-        .map(PathBuf::from)
-        .ok_or_else(|| format!("unknown project `{name}`; add it under [projects] in {}", p.user_config.display()))
-}
-
 pub fn create(p: &Paths, req: &Value) -> Result<Value, String> {
-    let project = field(req, "project")?;
-    let dir = project_dir(p, project)?;
+    let path = field(req, "path")?;
+    let dir = Path::new(path);
+    if !dir.is_dir() {
+        return Err(format!("path {path} is not a directory"));
+    }
     let request = field(req, "request")?;
     let source = req["source"].as_str();
     if source.is_some_and(|s| !SOURCES.contains(&s)) {
         return Err(format!("source must be one of {SOURCES:?}"));
     }
-    let cfg = config::load(p, Some(&dir))?;
-    let task = Task::new(project, req["issue"].as_str(), source, request, &cfg.loops.definition.steps[0]);
-    db::open(&p.db())?.insert(&task)?;
+    let cfg = config::load(p, Some(dir))?;
+    let create_worktree = req["create_worktree"].as_bool() == Some(true);
+    // A worktree branch is pushed by PR or MR creation, so its commits are not lost on cleanup.
+    if create_worktree && !ix::auto_create_enabled(&cfg) {
+        return Err("--create-worktree needs github.auto_create_pr or gitlab.auto_create_mr enabled".into());
+    }
+    let mut task = Task::new(path, req["issue"].as_str(), source, request, &cfg.loops.definition.steps[0]);
+    let db = db::open(&p.db())?;
+    db.insert(&mut task)?;
+    if create_worktree {
+        // Set before the add, so a failed add leaves a failed task that never runs in `path`.
+        let wt = p.worktrees().join(&task.id);
+        task.worktree = Some(wt.to_string_lossy().into_owned());
+        db.save(&task)?;
+        if let Err(e) = ix::worktree_add(dir, &wt, &branch(&task.id)) {
+            db.set_status(&task.id, "failed", Some(&e))?;
+            return Err(e);
+        }
+    }
     let (p2, id) = (p.clone(), task.id.clone());
     thread::spawn(move || describe(&p2, &id));
     Ok(json!({ "id": task.id }))
@@ -108,7 +119,7 @@ fn describe(p: &Paths, id: &str) {
     let res = (|| -> Result<(), String> {
         let db = db::open(&p.db())?;
         let t = db.get(id)?;
-        let dir = project_dir(p, &t.project)?;
+        let dir = PathBuf::from(&t.path);
         let cfg = config::load(p, Some(&dir))?;
         let prompt = format!(
             "Write a short description of this development task in at most 8 words. Do not use tools. Reply with only the description.\n\nRequest:\n{}",
@@ -127,15 +138,18 @@ fn describe(p: &Paths, id: &str) {
 }
 
 pub fn start(p: &Paths, id: &str) -> Result<Value, String> {
-    let t = db::open(&p.db())?.claim(id, &["new", "failed", "stopped"])?;
+    let db = db::open(&p.db())?;
+    check_parallel(p, &db, &db.get(id)?)?;
+    let t = db.claim(id, &["new", "failed", "stopped"])?;
     spawn_run(p, t.id.clone());
     Ok(json!({ "id": t.id }))
 }
 
 pub fn approve(p: &Paths, id: &str) -> Result<Value, String> {
     let db = db::open(&p.db())?;
+    check_parallel(p, &db, &db.get(id)?)?;
     let mut t = db.claim(id, &["waiting_review"])?;
-    let cfg = config::load(p, Some(&project_dir(p, &t.project)?))?;
+    let cfg = config::load(p, Some(Path::new(&t.path)))?;
     advance(&cfg, &mut t)?;
     db.save(&t)?;
     spawn_run(p, t.id.clone());
@@ -144,8 +158,9 @@ pub fn approve(p: &Paths, id: &str) -> Result<Value, String> {
 
 pub fn reject(p: &Paths, id: &str, note: &str) -> Result<Value, String> {
     let db = db::open(&p.db())?;
+    check_parallel(p, &db, &db.get(id)?)?;
     let mut t = db.claim(id, &["waiting_review"])?;
-    let cfg = config::load(p, Some(&project_dir(p, &t.project)?))?;
+    let cfg = config::load(p, Some(Path::new(&t.path)))?;
     t.iteration += 1;
     t.step = cfg.loop_named(&t.loop_name).steps[0].clone();
     t.review_note = (!note.is_empty()).then(|| note.to_string());
@@ -176,7 +191,7 @@ fn run(p: &Paths, id: &str) -> Result<(), String> {
     let db = db::open(&p.db())?;
     loop {
         let mut t = db.get(id)?;
-        let dir = project_dir(p, &t.project)?;
+        let dir = PathBuf::from(&t.path);
         let cfg = config::load(p, Some(&dir))?;
         let lp = cfg.loop_named(&t.loop_name).clone();
         let step = cfg
@@ -199,13 +214,7 @@ fn run(p: &Paths, id: &str) -> Result<(), String> {
             return halt(&db, &cfg, &t, "stopped", &format!("time limit reached in {} loop", t.loop_name));
         }
 
-        if t.worktree.is_none() {
-            let wt = p.worktrees().join(id);
-            ix::worktree_add(&dir, &wt, &branch(id))?;
-            t.worktree = Some(wt.to_string_lossy().into_owned());
-            db.save(&t)?;
-        }
-        let wt = PathBuf::from(t.worktree.clone().unwrap_or_default());
+        let wt = PathBuf::from(t.worktree.clone().unwrap_or_else(|| t.path.clone()));
 
         let key = key(&t);
         // Documents go to the markdown repo, or to the worktree when `repo` is empty.
@@ -270,16 +279,40 @@ fn run(p: &Paths, id: &str) -> Result<(), String> {
             }
         }
         if advance(&cfg, &mut t)? {
-            let msg = match ix::create_pr(&cfg, &wt, &branch(id)) {
-                Ok(()) => None,
-                Err(e) => Some(format!("PR/MR creation failed: {e}")),
-            };
-            db.set_status(id, "done", msg.as_deref())?;
-            ix::notify(&cfg, &format!("Done: {}", t.label()));
+            let mut notes = Vec::new();
+            if let Err(e) = ix::create_pr(&cfg, &wt) {
+                notes.push(format!("PR/MR creation failed: {e}"));
+            }
+            if let Some(w) = &t.worktree {
+                // Remove only a pushed branch. Otherwise its commits exist only in the worktree.
+                if notes.is_empty() && ix::auto_create_enabled(&cfg) {
+                    if let Err(e) = ix::remove_worktree(&dir, Path::new(w), &branch(id)) {
+                        notes.push(format!("worktree removal failed: {e}"));
+                    }
+                } else {
+                    notes.push("worktree kept: PR/MR not created".into());
+                }
+            }
+            let status = if notes.is_empty() { "done" } else { "error" };
+            let msg = (!notes.is_empty()).then(|| notes.join("; "));
+            db.set_status(id, status, msg.as_deref())?;
+            ix::notify(&cfg, &format!("{status}: {}", t.label()));
             return Ok(());
         }
         db.save(&t)?;
     }
+}
+
+/// Tasks in one checkout run in parallel only when a PR or MR is created, so their changes are not lost.
+fn check_parallel(p: &Paths, db: &Db, t: &Task) -> Result<(), String> {
+    if t.worktree.is_some() || !db.busy_in_checkout(&t.path, &t.id)? {
+        return Ok(());
+    }
+    let cfg = config::load(p, Some(Path::new(&t.path)))?;
+    if ix::auto_create_enabled(&cfg) {
+        return Ok(());
+    }
+    Err(format!("another task runs in {}; enable github.auto_create_pr or gitlab.auto_create_mr", t.path))
 }
 
 /// Moves to the next step. Returns true when the last execution step ends.
@@ -313,7 +346,7 @@ fn branch(id: &str) -> String {
     format!("dev-loop/{id}")
 }
 
-/// `<KEY>` is the issue ID, or the task UUID when no issue is set.
+/// `<KEY>` is the issue ID, or the task ID when no issue is set.
 fn key(t: &Task) -> String {
     t.issue
         .as_deref()
@@ -324,7 +357,7 @@ fn key(t: &Task) -> String {
 }
 
 fn build_prompt(t: &Task, key: &str, output: Option<&str>, review: bool, previous: Option<&str>) -> String {
-    let mut s = format!("Task key: {key}\nProject: {}\n", t.project);
+    let mut s = format!("Task key: {key}\nPath: {}\n", t.path);
     if let Some(issue) = &t.issue {
         s += &format!("Issue reference: {issue}\n");
     }
@@ -363,12 +396,13 @@ mod tests {
     }
 
     #[test]
-    fn key_is_issue_or_uuid_with_unsafe_chars_replaced() {
+    fn key_is_issue_or_task_id_with_unsafe_chars_replaced() {
         let with_issue = Task::new("p", Some("PROJ-12"), None, "r", "research");
         assert_eq!(key(&with_issue), "PROJ-12");
         assert_eq!(key(&Task::new("p", Some("a/b c"), None, "r", "research")), "a-b-c");
-        let no_issue = Task::new("p", None, None, "r", "research");
-        assert_eq!(key(&no_issue), no_issue.id);
+        let mut no_issue = Task::new("p", None, None, "r", "research");
+        no_issue.id = "7".into();
+        assert_eq!(key(&no_issue), "7");
     }
 
     #[test]
@@ -407,7 +441,7 @@ mod tests {
         let mut t = Task::new("proj", Some("PROJ-1"), None, "add login", "research");
         t.review_note = Some("fix tests".into());
         let p = build_prompt(&t, "PROJ-1", Some("/docs/x.md"), true, Some("{\"findings\":[]}"));
-        assert!(p.contains("Task key: PROJ-1\nProject: proj\n"));
+        assert!(p.contains("Task key: PROJ-1\nPath: proj\n"));
         assert!(p.contains("Issue reference: PROJ-1"));
         assert!(p.contains("Original request:\nadd login"));
         assert!(p.contains("Feedback to address:\nfix tests"));
@@ -445,8 +479,8 @@ mod tests {
     fn halt_stores_status_and_message() {
         let dir = temp("halt");
         let db = db::open(&dir.join("state.db")).unwrap();
-        let t = Task::new("p", None, None, "r", "research");
-        db.insert(&t).unwrap();
+        let mut t = Task::new("p", None, None, "r", "research");
+        db.insert(&mut t).unwrap();
         halt(&db, &defaults(), &t, "stopped", "iteration limit 3 reached").unwrap();
         let got = db.get(&t.id).unwrap();
         assert_eq!(got.status, "stopped");
@@ -455,16 +489,17 @@ mod tests {
     }
 
     #[test]
-    fn create_rejects_unknown_project_and_bad_source() {
+    fn create_rejects_missing_path_and_bad_source() {
         let dir = temp("create");
-        let user = dir.join("user.toml");
-        fs::write(&user, "[projects]\nproj = \"/tmp\"\n").unwrap();
-        let p = Paths { home: dir.clone(), user_config: user };
+        let p = Paths { home: dir.clone(), user_config: dir.join("user.toml") };
 
-        let err = create(&p, &json!({ "project": "other", "request": "r" })).unwrap_err();
-        assert!(err.contains("unknown project `other`"), "{err}");
+        let err = create(&p, &json!({ "path": dir.to_string_lossy(), "request": "r", "create_worktree": true })).unwrap_err();
+        assert!(err.contains("--create-worktree needs"), "{err}");
 
-        let err = create(&p, &json!({ "project": "proj", "request": "r", "source": "slack" })).unwrap_err();
+        let err = create(&p, &json!({ "path": "/nonexistent/dl", "request": "r" })).unwrap_err();
+        assert!(err.contains("is not a directory"), "{err}");
+
+        let err = create(&p, &json!({ "path": dir.to_string_lossy(), "request": "r", "source": "slack" })).unwrap_err();
         assert!(err.contains("source must be one of"), "{err}");
         fs::remove_dir_all(dir).unwrap();
     }

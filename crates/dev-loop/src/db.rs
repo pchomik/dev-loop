@@ -3,7 +3,6 @@ use serde::Serialize;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::fs;
-use uuid::Uuid;
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -12,8 +11,8 @@ fn es<E: std::fmt::Display>(e: E) -> String {
 }
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS tasks (
-    id TEXT PRIMARY KEY,
-    project TEXT NOT NULL,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    path TEXT NOT NULL,
     issue TEXT,
     source TEXT,
     request TEXT NOT NULL,
@@ -30,12 +29,12 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS tasks (
     created_at INTEGER NOT NULL
 );";
 
-const COLS: &str = "id, project, issue, source, request, short_description, status, loop_name, step, iteration, loop_elapsed, cost, worktree, review_note, message, created_at";
+const COLS: &str = "id, path, issue, source, request, short_description, status, loop_name, step, iteration, loop_elapsed, cost, worktree, review_note, message, created_at";
 
 #[derive(Serialize, Clone, Debug)]
 pub struct Task {
     pub id: String,
-    pub project: String,
+    pub path: String,
     pub issue: Option<String>,
     pub source: Option<String>,
     pub request: String,
@@ -55,14 +54,14 @@ pub struct Task {
 }
 
 impl Task {
-    pub fn new(project: &str, issue: Option<&str>, source: Option<&str>, request: &str, first_step: &str) -> Self {
+    pub fn new(path: &str, issue: Option<&str>, source: Option<&str>, request: &str, first_step: &str) -> Self {
         let created_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         Task {
-            id: Uuid::new_v4().to_string(),
-            project: project.into(),
+            id: String::new(),
+            path: path.into(),
             issue: issue.map(Into::into),
             source: source.map(Into::into),
             request: request.into(),
@@ -87,8 +86,8 @@ impl Task {
 
 fn from_row(r: &Row) -> rusqlite::Result<Task> {
     Ok(Task {
-        id: r.get(0)?,
-        project: r.get(1)?,
+        id: r.get::<_, i64>(0)?.to_string(),
+        path: r.get(1)?,
         issue: r.get(2)?,
         source: r.get(3)?,
         request: r.get(4)?,
@@ -117,27 +116,29 @@ pub fn open(path: &Path) -> Result<Db> {
 }
 
 impl Db {
-    pub fn insert(&self, t: &Task) -> Result<()> {
+    /// Stores the task and sets its ID to the next index, starting at 1.
+    pub fn insert(&self, t: &mut Task) -> Result<()> {
         self.0
             .execute(
                 &format!("INSERT INTO tasks ({COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)"),
                 params![
-                    t.id, t.project, t.issue, t.source, t.request, t.short_description, t.status,
+                    None::<i64>, t.path, t.issue, t.source, t.request, t.short_description, t.status,
                     t.loop_name, t.step, t.iteration, t.loop_elapsed, t.cost, t.worktree,
                     t.review_note, t.message, t.created_at
                 ],
             )
             .map_err(es)?;
+        t.id = self.0.last_insert_rowid().to_string();
         Ok(())
     }
 
-    /// Tasks whose ID starts with `prefix`.
-    pub fn find(&self, prefix: &str) -> Result<Vec<Task>> {
+    /// Task with ID `id`. Empty `id` returns all tasks.
+    pub fn find(&self, id: &str) -> Result<Vec<Task>> {
         let mut s = self
             .0
-            .prepare(&format!("SELECT {COLS} FROM tasks WHERE id LIKE ?1 || '%' ORDER BY created_at"))
+            .prepare(&format!("SELECT {COLS} FROM tasks WHERE ?1 = '' OR id = ?1 ORDER BY created_at"))
             .map_err(es)?;
-        let rows = s.query_map([prefix], from_row).map_err(es)?;
+        let rows = s.query_map([id], from_row).map_err(es)?;
         rows.collect::<rusqlite::Result<_>>().map_err(es)
     }
 
@@ -205,6 +206,20 @@ impl Db {
         Ok(())
     }
 
+    /// True when another task in the same checkout (no worktree) is running or waits for review.
+    pub fn busy_in_checkout(&self, path: &str, id: &str) -> Result<bool> {
+        let n: i64 = self
+            .0
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE path=?1 AND id!=?2 AND worktree IS NULL
+                 AND status IN ('running','waiting_review')",
+                params![path, id],
+                |r| r.get(0),
+            )
+            .map_err(es)?;
+        Ok(n > 0)
+    }
+
     /// Runs left `running` by a previous daemon cannot continue.
     pub fn fail_running(&self) -> Result<()> {
         self.0
@@ -233,8 +248,8 @@ mod tests {
     #[test]
     fn insert_get_and_save_round_trip() {
         let (db, dir) = open_temp("crud");
-        let t = Task::new("proj", Some("PROJ-1"), Some("jira"), "do it", "research");
-        db.insert(&t).unwrap();
+        let mut t = Task::new("proj", Some("PROJ-1"), Some("jira"), "do it", "research");
+        db.insert(&mut t).unwrap();
 
         let got = db.get(&t.id).unwrap();
         assert_eq!(got.request, "do it");
@@ -263,12 +278,12 @@ mod tests {
     }
 
     #[test]
-    fn get_reports_no_match_and_ambiguous_prefix() {
+    fn get_reports_no_match_and_lists_all_on_empty_id() {
         let (db, dir) = open_temp("get");
-        db.insert(&Task::new("p", None, None, "a", "research")).unwrap();
-        db.insert(&Task::new("p", None, None, "b", "research")).unwrap();
-        assert!(db.get("no-such-id").unwrap_err().contains("no task"));
-        assert!(db.get("").unwrap_err().contains("matches 2 tasks"));
+        db.insert(&mut Task::new("p", None, None, "a", "research")).unwrap();
+        db.insert(&mut Task::new("p", None, None, "b", "research")).unwrap();
+        assert!(db.get("99").unwrap_err().contains("no task"));
+        assert_eq!(db.get("1").unwrap().request, "a");
         assert_eq!(db.find("").unwrap().len(), 2);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -276,8 +291,8 @@ mod tests {
     #[test]
     fn claim_checks_status_then_marks_running() {
         let (db, dir) = open_temp("claim");
-        let t = Task::new("p", None, None, "a", "research");
-        db.insert(&t).unwrap();
+        let mut t = Task::new("p", None, None, "a", "research");
+        db.insert(&mut t).unwrap();
         assert!(db.claim(&t.id, &["failed"]).unwrap_err().contains("is new"));
 
         let claimed = db.claim(&t.id, &["new"]).unwrap();
@@ -288,10 +303,24 @@ mod tests {
     }
 
     #[test]
+    fn busy_in_checkout_ignores_own_task_and_worktree_tasks() {
+        let (db, dir) = open_temp("busy");
+        let mut a = Task::new("/repo", None, None, "a", "research");
+        let mut b = Task::new("/repo", None, None, "b", "research");
+        db.insert(&mut a).unwrap();
+        db.insert(&mut b).unwrap();
+        db.claim(&a.id, &["new"]).unwrap();
+        assert!(db.busy_in_checkout("/repo", &b.id).unwrap());
+        assert!(!db.busy_in_checkout("/repo", &a.id).unwrap());
+        assert!(!db.busy_in_checkout("/other", &b.id).unwrap());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn fail_running_marks_interrupted_tasks_failed() {
         let (db, dir) = open_temp("restart");
-        let t = Task::new("p", None, None, "a", "research");
-        db.insert(&t).unwrap();
+        let mut t = Task::new("p", None, None, "a", "research");
+        db.insert(&mut t).unwrap();
         db.claim(&t.id, &["new"]).unwrap();
         db.fail_running().unwrap();
         let got = db.get(&t.id).unwrap();

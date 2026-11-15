@@ -133,8 +133,6 @@ pub struct Config {
     pub gitlab: Gitlab,
     pub telegram: Telegram,
     pub markdown: Markdown,
-    #[serde(default)]
-    pub projects: BTreeMap<String, String>,
 }
 
 impl Config {

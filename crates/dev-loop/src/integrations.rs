@@ -21,6 +21,13 @@ pub fn worktree_add(project: &Path, wt: &Path, branch: &str) -> Result<(), Strin
     run("git", project, &["worktree", "add", "-b", branch, wt.as_ref(), "HEAD"])
 }
 
+/// Removes the worktree with its uncommitted files, then force-deletes its branch, even with unmerged commits.
+pub fn remove_worktree(project: &Path, wt: &Path, branch: &str) -> Result<(), String> {
+    let wt = wt.to_string_lossy();
+    run("git", project, &["worktree", "remove", "--force", wt.as_ref()])?;
+    run("git", project, &["branch", "-D", branch])
+}
+
 pub fn commit(root: &Path, file: &Path, msg: &str, push: bool) -> Result<(), String> {
     let f = file.to_string_lossy();
     run("git", root, &["add", "--", f.as_ref()])?;
@@ -31,16 +38,22 @@ pub fn commit(root: &Path, file: &Path, msg: &str, push: bool) -> Result<(), Str
     Ok(())
 }
 
-pub fn create_pr(cfg: &Config, wt: &Path, branch: &str) -> Result<(), String> {
+/// Pushes the checked-out branch under the same remote name, then opens the PR or MR.
+/// True when a PR or MR is created for each task. Parallel tasks need this.
+pub fn auto_create_enabled(cfg: &Config) -> bool {
+    (cfg.github.enabled && cfg.github.auto_create_pr) || (cfg.gitlab.enabled && cfg.gitlab.auto_create_mr)
+}
+
+pub fn create_pr(cfg: &Config, wt: &Path) -> Result<(), String> {
     // Check each tool exists before pushing, so a missing tool leaves no pushed branch.
     if cfg.github.enabled && cfg.github.auto_create_pr {
         run(&cfg.github.gh_path, wt, &["--version"])?;
-        run("git", wt, &["push", "-u", "origin", branch])?;
+        run("git", wt, &["push", "-u", "origin", "HEAD"])?;
         run(&cfg.github.gh_path, wt, &["pr", "create", "--fill"])?;
     }
     if cfg.gitlab.enabled && cfg.gitlab.auto_create_mr {
         run(&cfg.gitlab.glab_path, wt, &["--version"])?;
-        run("git", wt, &["push", "-u", "origin", branch])?;
+        run("git", wt, &["push", "-u", "origin", "HEAD"])?;
         run(&cfg.gitlab.glab_path, wt, &["mr", "create", "--fill", "--yes"])?;
     }
     Ok(())
@@ -117,6 +130,23 @@ mod tests {
     }
 
     #[test]
+    fn remove_worktree_removes_uncommitted_files_and_branch_with_commits() {
+        let dir = temp("rm");
+        let repo = dir.join("repo");
+        git_repo(&repo);
+        let wt = dir.join("wt");
+        worktree_add(&repo, &wt, "dev-loop/y").unwrap();
+        fs::write(wt.join("README"), "y").unwrap();
+        run("git", &wt, &["commit", "-qam", "work"]).unwrap();
+        fs::write(wt.join("untracked.md"), "doc").unwrap();
+        remove_worktree(&repo, &wt, "dev-loop/y").unwrap();
+        assert!(!wt.exists());
+        let branches = process::Command::new("git").current_dir(&repo).args(["branch", "--list", "dev-loop/y"]).output().unwrap();
+        assert!(String::from_utf8_lossy(&branches.stdout).trim().is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn commit_adds_only_given_file() {
         let dir = temp("commit");
         git_repo(&dir);
@@ -140,7 +170,7 @@ mod tests {
 
     #[test]
     fn create_pr_does_nothing_when_disabled() {
-        assert!(create_pr(&defaults(), Path::new("/nonexistent"), "dev-loop/x").is_ok());
+        assert!(create_pr(&defaults(), Path::new("/nonexistent")).is_ok());
     }
 
     #[test]
@@ -149,6 +179,6 @@ mod tests {
         cfg.github.enabled = true;
         cfg.github.auto_create_pr = true;
         cfg.github.gh_path = "/nonexistent/gh".into();
-        assert!(create_pr(&cfg, Path::new("/nonexistent"), "dev-loop/x").is_err());
+        assert!(create_pr(&cfg, Path::new("/nonexistent")).is_err());
     }
 }

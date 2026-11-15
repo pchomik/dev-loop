@@ -10,7 +10,7 @@
     </p>
     <p align="center">
         dev-loop orchestrates AI agent steps (pi-agent, Cursor) for feature development loops. <br>
-        Each feature runs a definition loop and an execution loop in its own git worktree.
+        Each feature runs a definition loop and an execution loop in its task directory.
     </p>
 </p>
 
@@ -19,7 +19,7 @@
 - Runs each feature through two loops: Definition (Research, FRD, user review) and Execution (Development, code review, rules review, simplification review).
 - Runs each step as an agent skill set in configuration, on pi-agent or Cursor.
 - User review step notifies you and waits for approval. No agent runs until you approve or reject.
-- Each task gets its own git worktree named by task UUID.
+- Each task runs in its `--path` directory. `--create-worktree` gives a task its own git worktree named by task ID.
 - Enforces an iteration limit per loop (default `3`) and a time limit per loop (default `1h`).
 - Checks that each step's output file exists when the step defines one.
 - Creates tasks from Jira, GitHub issue, GitLab issue or a local file.
@@ -57,21 +57,24 @@ Then use the client:
 
 ```sh
     # Create a task from a request, prints the task ID
-    dev-loop-ctl create --project my-app --request "Add CSV export to reports"
+    dev-loop-ctl create --path ~/src/my-app --request "Add CSV export to reports"
 
     # Create a task from a local file, with an issue reference
-    dev-loop-ctl create --project my-app --source file --issue PROJ-123 --file feature.md
+    dev-loop-ctl create --path ~/src/my-app --source file --issue PROJ-123 --file feature.md
 
-    # Start a new or failed task in its worktree
+    # Create a task with its own worktree, default path is the current directory
+    dev-loop-ctl create --create-worktree --request "Add CSV export to reports"
+
+    # Start a new or failed task
     dev-loop-ctl start <ID>
 
     # Approve or reject the user review step
     dev-loop-ctl approve <ID>
     dev-loop-ctl reject <ID> --note "Missing error cases"
 
-    # Show all tasks, or one task by ID prefix
+    # Show all tasks, or one task by ID
     dev-loop-ctl status
-    dev-loop-ctl status <ID-PREFIX>
+    dev-loop-ctl status <ID>
 ```
 
 `--request` and `--file` are mutually exclusive. Use one of them.
@@ -82,25 +85,10 @@ dev-loop reads two files in the same format. Project values override user values
 
 | File                                  | Scope                          |
 |---------------------------------------|--------------------------------|
-| `~/.config/dev-loop/config.toml`      | User. Also holds `[projects]`. |
+| `~/.config/dev-loop/config.toml`      | User. |
 | `dev-loop.toml`                       | Project. Overrides user values. |
 
 Built-in defaults live in [`crates/dev-loop/src/default-config.toml`](crates/dev-loop/src/default-config.toml).
-
-<details>
-
-<summary>projects</summary>
-
-### projects
-
-Map a project name to its repository path. `dev-loop-ctl create --project` uses this name.
-
-```toml
-    [projects]
-    my-app = "/home/me/src/my-app"
-```
-
-</details>
 
 <details>
 
@@ -125,7 +113,7 @@ Choose the agent and set the binary paths.
 
 ### steps
 
-Each step sets a `label`, and optionally a `skill` and an `output` file. `<KEY>` in `output` is the issue ID, or the task UUID when no issue is set.
+Each step sets a `label`, and optionally a `skill` and an `output` file. `<KEY>` in `output` is the issue ID, or the task ID when no issue is set.
 
 ```toml
     [steps.research]

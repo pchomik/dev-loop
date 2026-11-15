@@ -20,8 +20,12 @@ struct Cli {
 enum Cmd {
     /// Create a task from a request
     Create {
+        /// Task directory. Default: current directory
         #[arg(long)]
-        project: String,
+        path: Option<PathBuf>,
+        /// Run the task in its own git worktree
+        #[arg(long)]
+        create_worktree: bool,
         /// jira, github, gitlab or file
         #[arg(long, value_parser = ["jira", "github", "gitlab", "file"])]
         source: Option<String>,
@@ -44,7 +48,7 @@ enum Cmd {
         #[arg(long)]
         note: Option<String>,
     },
-    /// Show tasks, or one task by ID prefix
+    /// Show tasks, or one task by ID
     Status { id: Option<String> },
 }
 
@@ -57,14 +61,20 @@ fn main() {
 
 fn run(cmd: Cmd) -> Result<(), String> {
     match cmd {
-        Cmd::Create { project, source, issue, request, file } => {
+        Cmd::Create { path, create_worktree, source, issue, request, file } => {
             let request = match (request, file) {
                 (Some(r), None) => r,
                 (None, Some(f)) => fs::read_to_string(&f).map_err(|e| format!("{}: {e}", f.display()))?,
                 _ => return Err("give --request or --file".into()),
             };
+            let path = match path {
+                Some(p) => p,
+                None => env::current_dir().map_err(|e| e.to_string())?,
+            };
+            let path = fs::canonicalize(&path).map_err(|e| format!("{}: {e}", path.display()))?;
             let resp = send(json!({
-                "cmd": "create", "project": project, "source": source, "issue": issue, "request": request
+                "cmd": "create", "path": path, "create_worktree": create_worktree,
+                "source": source, "issue": issue, "request": request
             }))?;
             println!("{}", resp["id"].as_str().unwrap_or_default());
         }
@@ -93,7 +103,7 @@ fn print_task(t: &Value) {
         "{}  {:<16} {:<10} {:<12} {}/{} #{}  ${:.4}  {}",
         s("id"),
         s("status"),
-        s("project"),
+        s("path"),
         s("issue"),
         s("loop_name"),
         s("step"),
@@ -162,13 +172,13 @@ mod tests {
 
     #[test]
     fn create_needs_request_or_file() {
-        let cmd = Cmd::Create { project: "p".into(), source: None, issue: None, request: None, file: None };
+        let cmd = Cmd::Create { path: None, create_worktree: false, source: None, issue: None, request: None, file: None };
         assert!(run(cmd).unwrap_err().contains("--request or --file"));
     }
 
     #[test]
     fn create_reports_unreadable_file() {
-        let cmd = Cmd::Create { project: "p".into(), source: None, issue: None, request: None, file: Some("/nonexistent/req.md".into()) };
+        let cmd = Cmd::Create { path: None, create_worktree: false, source: None, issue: None, request: None, file: Some("/nonexistent/req.md".into()) };
         assert!(run(cmd).unwrap_err().contains("req.md"));
     }
 
