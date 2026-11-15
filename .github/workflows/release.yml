@@ -28,12 +28,12 @@ jobs:
         run: cargo build --release --workspace --locked
       - name: Package zip
         run: |
-          zip -j "dev-loop-${TAG}-${{ matrix.target }}.zip" \
-            target/release/dev-loop target/release/dev-loop-ctl
+          zip -j "dl-${TAG}-${{ matrix.target }}.zip" \
+            target/release/dl-serve target/release/dl
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: dev-loop-*.zip
+          path: dl-*.zip
           if-no-files-found: error
 
   upload:

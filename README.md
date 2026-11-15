@@ -26,14 +26,14 @@
 - Stores local state in SQLite.
 - Optional GitHub (`gh`) and GitLab (`glab`) integration: pull request and merge request creation.
 - Optional Telegram notifications.
-- Command-line client (`dev-loop-ctl`) to create, start, approve, reject and check tasks.
+- Command-line client (`dl`) to create, start, approve, reject and check tasks.
 
 ## Crates
 
 | Crate            | Binary           | Role                                                        |
 |------------------|------------------|-------------------------------------------------------------|
-| `crates/dev-loop`     | `dev-loop`     | Main app. Runs loops, steps and agents. Listens on a named pipe. |
-| `crates/dev-loop-ctl` | `dev-loop-ctl` | Client. Sends JSON commands to the main app over the named pipe. |
+| `crates/dl-serve`     | `dl-serve`     | Main app. Runs loops, steps and agents. Listens on a named pipe. |
+| `crates/dl` | `dl` | Client. Sends JSON commands to the main app over the named pipe. |
 
 ## Workflow
 
@@ -50,31 +50,31 @@ A rejected user review restarts the Definition loop. Each review step writes a f
 Start the main app. It creates a named pipe in `~/.local/share/dev-loop/`:
 
 ```sh
-    dev-loop
+    dl-serve
 ```
 
 Then use the client:
 
 ```sh
     # Create a task from a request, prints the task ID
-    dev-loop-ctl create --path ~/src/my-app --request "Add CSV export to reports"
+    dl create --path ~/src/my-app --request "Add CSV export to reports"
 
     # Create a task from a local file, with an issue reference
-    dev-loop-ctl create --path ~/src/my-app --source file --issue PROJ-123 --file feature.md
+    dl create --path ~/src/my-app --source file --issue PROJ-123 --file feature.md
 
     # Create a task with its own worktree, default path is the current directory
-    dev-loop-ctl create --create-worktree --request "Add CSV export to reports"
+    dl create --create-worktree --request "Add CSV export to reports"
 
     # Start a new or failed task
-    dev-loop-ctl start <ID>
+    dl start <ID>
 
     # Approve or reject the user review step
-    dev-loop-ctl approve <ID>
-    dev-loop-ctl reject <ID> --note "Missing error cases"
+    dl approve <ID>
+    dl reject <ID> --note "Missing error cases"
 
     # Show all tasks, or one task by ID
-    dev-loop-ctl status
-    dev-loop-ctl status <ID>
+    dl status
+    dl status <ID>
 ```
 
 `--request` and `--file` are mutually exclusive. Use one of them.
@@ -88,7 +88,7 @@ dev-loop reads two files in the same format. Project values override user values
 | `~/.config/dev-loop/config.toml`      | User. |
 | `dev-loop.toml`                       | Project. Overrides user values. |
 
-Built-in defaults live in [`crates/dev-loop/src/default-config.toml`](crates/dev-loop/src/default-config.toml).
+Built-in defaults live in [`crates/dl-serve/src/default-config.toml`](crates/dl-serve/src/default-config.toml).
 
 <details>
 
@@ -222,11 +222,11 @@ Requires a Rust toolchain ([rustup](https://rustup.rs/)) and git. Install the ag
     cargo build --release --workspace --locked
 ```
 
-Binaries are in `target/release/`: `dev-loop` and `dev-loop-ctl`.
+Binaries are in `target/release/`: `dl-serve` and `dl`.
 
 ```sh
-    cargo install --path crates/dev-loop
-    cargo install --path crates/dev-loop-ctl
+    cargo install --path crates/dl-serve
+    cargo install --path crates/dl
 ```
 
 ### From source for testing

@@ -10,7 +10,7 @@ use std::{env, io, process};
 use uuid::Uuid;
 
 #[derive(Parser)]
-#[command(name = "dev-loop-ctl", about = "Control the dev-loop app")]
+#[command(name = "dl", about = "Control the dl-serve app")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -54,7 +54,7 @@ enum Cmd {
 
 fn main() {
     if let Err(e) = run(Cli::parse().cmd) {
-        eprintln!("dev-loop-ctl: {e}");
+        eprintln!("dl: {e}");
         process::exit(1);
     }
 }
@@ -123,7 +123,7 @@ fn home() -> PathBuf {
 /// Sends one request and waits for the reply on a per-request FIFO.
 fn send(mut req: Value) -> Result<Value, String> {
     let pipe = home().join("ctl.fifo");
-    let reply = env::temp_dir().join(format!("dev-loop-ctl-{}.fifo", Uuid::new_v4()));
+    let reply = env::temp_dir().join(format!("dl-ctl-{}.fifo", Uuid::new_v4()));
     mkfifo(&reply)?;
     let res = exchange(&pipe, &reply, &mut req);
     let _ = fs::remove_file(&reply);
@@ -143,7 +143,7 @@ fn exchange(pipe: &Path, reply: &Path, req: &mut Value) -> Result<Value, String>
         .write(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(pipe)
-        .map_err(|e| format!("dev-loop is not running ({}): {e}", pipe.display()))?;
+        .map_err(|e| format!("dl-serve is not running ({}): {e}", pipe.display()))?;
     writeln!(w, "{req}").map_err(|e| e.to_string())?;
     let mut line = String::new();
     BufReader::new(reader).read_line(&mut line).map_err(|e| e.to_string())?;
@@ -188,7 +188,7 @@ mod tests {
         let reply = dir.join("reply.fifo");
         mkfifo(&reply).unwrap();
         let err = exchange(&dir.join("ctl.fifo"), &reply, &mut json!({ "cmd": "status" })).unwrap_err();
-        assert!(err.contains("dev-loop is not running"), "{err}");
+        assert!(err.contains("dl-serve is not running"), "{err}");
         fs::remove_dir_all(dir).unwrap();
     }
 

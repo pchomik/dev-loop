@@ -127,7 +127,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
-name = "dev-loop"
+name = "dl"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "libc",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "dl-serve"
 version = "0.1.0"
 dependencies = [
  "libc",
@@ -135,16 +145,6 @@ dependencies = [
  "serde",
  "serde_json",
  "toml",
-]
-
-[[package]]
-name = "dev-loop-ctl"
-version = "0.1.0"
-dependencies = [
- "clap",
- "libc",
- "serde_json",
- "uuid",
 ]
 
 [[package]]

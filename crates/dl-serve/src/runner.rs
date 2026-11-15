@@ -133,7 +133,7 @@ fn describe(p: &Paths, id: &str) {
         }
     })();
     if let Err(e) = res {
-        eprintln!("dev-loop: task {id}: short description failed: {e}");
+        eprintln!("dl-serve: task {id}: short description failed: {e}");
     }
 }
 
@@ -178,7 +178,7 @@ fn spawn_run(p: &Paths, id: String) {
     let p = p.clone();
     thread::spawn(move || {
         if let Err(e) = run(&p, &id) {
-            eprintln!("dev-loop: task {id}: {e}");
+            eprintln!("dl-serve: task {id}: {e}");
             if let Ok(db) = db::open(&p.db()) {
                 let _ = db.set_status(&id, "failed", Some(&e));
             }

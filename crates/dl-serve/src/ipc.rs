@@ -19,7 +19,7 @@ pub fn serve(p: &Paths) -> Result<(), String> {
     }
     // O_RDWR keeps the pipe open when no ctl client is connected.
     let f = OpenOptions::new().read(true).write(true).open(&pipe).map_err(|e| e.to_string())?;
-    eprintln!("dev-loop: listening on {}", pipe.display());
+    eprintln!("dl-serve: listening on {}", pipe.display());
     for line in BufReader::new(f).lines() {
         let line = line.map_err(|e| e.to_string())?;
         let p = p.clone();
@@ -39,7 +39,7 @@ fn mkfifo(path: &Path) -> Result<(), String> {
 fn handle(p: &Paths, line: &str) {
     let req: Value = match serde_json::from_str(line) {
         Ok(v) => v,
-        Err(e) => return eprintln!("dev-loop: bad request: {e}"),
+        Err(e) => return eprintln!("dl-serve: bad request: {e}"),
     };
     let resp = match dispatch(p, &req) {
         Ok(data) => json!({ "ok": true, "data": data }),
@@ -51,7 +51,7 @@ fn handle(p: &Paths, line: &str) {
         Ok(mut f) => {
             let _ = writeln!(f, "{resp}");
         }
-        Err(e) => eprintln!("dev-loop: cannot reply on {reply}: {e}"),
+        Err(e) => eprintln!("dl-serve: cannot reply on {reply}: {e}"),
     }
 }
 

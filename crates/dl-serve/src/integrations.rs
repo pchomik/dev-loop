@@ -61,7 +61,7 @@ pub fn create_pr(cfg: &Config, wt: &Path) -> Result<(), String> {
 
 /// Logs to stderr and sends a Telegram message when Telegram is enabled.
 pub fn notify(cfg: &Config, text: &str) {
-    eprintln!("dev-loop: {text}");
+    eprintln!("dl-serve: {text}");
     let (token, chat) = (&cfg.telegram.token, &cfg.telegram.chat_id);
     if !cfg.telegram.enabled || token.is_empty() || chat.is_empty() {
         return;
@@ -74,7 +74,7 @@ pub fn notify(cfg: &Config, text: &str) {
         .output();
     match res {
         Ok(o) if o.status.success() => {}
-        _ => eprintln!("dev-loop: telegram notification failed"),
+        _ => eprintln!("dl-serve: telegram notification failed"),
     }
 }
 

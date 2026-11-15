@@ -1,5 +1,5 @@
 [package]
-name = "dev-loop-ctl"
+name = "dl"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Command-line client for the dev-loop orchestrator"
+description = "Command-line client for the dl-serve orchestrator"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

@@ -7,7 +7,7 @@ mod runner;
 
 fn main() {
     if let Err(e) = ipc::serve(&config::Paths::from_env()) {
-        eprintln!("dev-loop: {e}");
+        eprintln!("dl-serve: {e}");
         std::process::exit(1);
     }
 }
