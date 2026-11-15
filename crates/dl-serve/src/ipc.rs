@@ -62,7 +62,7 @@ fn dispatch(p: &Paths, req: &Value) -> Result<Value, String> {
         "start" => runner::start(p, prefix),
         "approve" => runner::approve(p, prefix),
         "reject" => runner::reject(p, prefix, req["note"].as_str().unwrap_or("")),
-        "status" => runner::status(p, prefix),
+        "list" | "ls" => runner::status(p, prefix),
         cmd => Err(format!("unknown command `{cmd}`")),
     }
 }
@@ -80,9 +80,16 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_status_lists_tasks() {
-        let p = paths("status");
-        assert_eq!(dispatch(&p, &json!({ "cmd": "status", "id": "" })).unwrap(), json!([]));
+    fn dispatch_list_lists_tasks() {
+        let p = paths("list");
+        assert_eq!(dispatch(&p, &json!({ "cmd": "list", "id": "" })).unwrap(), json!([]));
+        fs::remove_dir_all(&p.home).unwrap();
+    }
+
+    #[test]
+    fn dispatch_ls_lists_tasks() {
+        let p = paths("ls");
+        assert_eq!(dispatch(&p, &json!({ "cmd": "ls", "id": "" })).unwrap(), json!([]));
         fs::remove_dir_all(&p.home).unwrap();
     }
 
@@ -107,7 +114,7 @@ mod tests {
         let reply = p.home.join("reply.out");
         fs::create_dir_all(&p.home).unwrap();
         fs::write(&reply, "").unwrap();
-        let line = json!({ "cmd": "status", "id": "", "reply": reply.to_string_lossy() }).to_string();
+        let line = json!({ "cmd": "list", "id": "", "reply": reply.to_string_lossy() }).to_string();
         handle(&p, &line);
         let resp: Value = serde_json::from_str(&fs::read_to_string(&reply).unwrap()).unwrap();
         assert_eq!(resp, json!({ "ok": true, "data": [] }));

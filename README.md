@@ -73,8 +73,10 @@ Then use the client:
     dl reject <ID> --note "Missing error cases"
 
     # Show all tasks, or one task by ID
-    dl status
-    dl status <ID>
+    dl list
+    dl ls
+    dl list <ID>
+    dl ls <ID>
 ```
 
 `--request` and `--file` are mutually exclusive. Use one of them.

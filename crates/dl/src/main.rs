@@ -49,7 +49,9 @@ enum Cmd {
         note: Option<String>,
     },
     /// Show tasks, or one task by ID
-    Status { id: Option<String> },
+    List { id: Option<String> },
+    /// Alias for list
+    Ls { id: Option<String> },
 }
 
 fn main() {
@@ -87,8 +89,8 @@ fn run(cmd: Cmd) -> Result<(), String> {
         Cmd::Reject { id, note } => {
             send(json!({ "cmd": "reject", "id": id, "note": note.unwrap_or_default() }))?;
         }
-        Cmd::Status { id } => {
-            let tasks = send(json!({ "cmd": "status", "id": id.unwrap_or_default() }))?;
+        Cmd::List { id } | Cmd::Ls { id } => {
+            let tasks = send(json!({ "cmd": "list", "id": id.unwrap_or_default() }))?;
             for t in tasks.as_array().into_iter().flatten() {
                 print_task(t);
             }
@@ -187,7 +189,7 @@ mod tests {
         let dir = temp("nopipe");
         let reply = dir.join("reply.fifo");
         mkfifo(&reply).unwrap();
-        let err = exchange(&dir.join("ctl.fifo"), &reply, &mut json!({ "cmd": "status" })).unwrap_err();
+        let err = exchange(&dir.join("ctl.fifo"), &reply, &mut json!({ "cmd": "list" })).unwrap_err();
         assert!(err.contains("dl-serve is not running"), "{err}");
         fs::remove_dir_all(dir).unwrap();
     }
@@ -210,9 +212,9 @@ mod tests {
             writeln!(out, "{}", json!({ "ok": true, "data": { "cmd": req["cmd"] } })).unwrap();
         });
 
-        let resp = exchange(&pipe, &reply, &mut json!({ "cmd": "status" })).unwrap();
+        let resp = exchange(&pipe, &reply, &mut json!({ "cmd": "list" })).unwrap();
         daemon.join().unwrap();
-        assert_eq!(resp, json!({ "ok": true, "data": { "cmd": "status" } }));
+        assert_eq!(resp, json!({ "ok": true, "data": { "cmd": "list" } }));
         fs::remove_dir_all(dir).unwrap();
     }
 }
