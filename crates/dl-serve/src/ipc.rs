@@ -62,6 +62,7 @@ fn dispatch(p: &Paths, req: &Value) -> Result<Value, String> {
         "start" => runner::start(p, prefix),
         "approve" => runner::approve(p, prefix),
         "reject" => runner::reject(p, prefix, req["note"].as_str().unwrap_or("")),
+        "abort" => runner::abort(p, prefix),
         "list" | "ls" => runner::status(p, prefix),
         cmd => Err(format!("unknown command `{cmd}`")),
     }
@@ -70,6 +71,7 @@ fn dispatch(p: &Paths, req: &Value) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Task;
     use std::os::unix::fs::FileTypeExt;
     use std::path::PathBuf;
 
@@ -90,6 +92,18 @@ mod tests {
     fn dispatch_ls_lists_tasks() {
         let p = paths("ls");
         assert_eq!(dispatch(&p, &json!({ "cmd": "ls", "id": "" })).unwrap(), json!([]));
+        fs::remove_dir_all(&p.home).unwrap();
+    }
+
+    #[test]
+    fn dispatch_abort_stops_running_task() {
+        let p = paths("abort");
+        let db = db::open(&p.db()).unwrap();
+        let mut t = Task::new("p", None, None, "r", "research");
+        db.insert(&mut t).unwrap();
+        db.claim(&t.id, &["new"]).unwrap();
+        assert_eq!(dispatch(&p, &json!({ "cmd": "abort", "id": t.id })).unwrap(), json!({ "id": t.id }));
+        assert_eq!(db.get(&t.id).unwrap().status, "stopped");
         fs::remove_dir_all(&p.home).unwrap();
     }
 

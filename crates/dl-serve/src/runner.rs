@@ -1,5 +1,5 @@
 use crate::agent;
-use crate::config::{self, Config, Paths, StepKind};
+use crate::config::{self, Config, Loop, Paths, StepKind};
 use crate::db::{self, Db, Task};
 use crate::integrations as ix;
 use serde::{Deserialize, Serialize};
@@ -125,7 +125,9 @@ fn describe(p: &Paths, id: &str) {
             "Write a short description of this development task in at most 8 words. Do not use tools. Reply with only the description.\n\nRequest:\n{}",
             t.request
         );
-        let out = agent::run(&cfg, &prompt, None, &dir, Duration::from_secs(300))?;
+        let Some(out) = agent::run(&cfg, &prompt, None, &dir, id, Duration::from_secs(300), || Ok(true))? else {
+            return Ok(());
+        };
         db.add_cost(id, out.cost)?;
         match out.ok().then(|| out.text.trim().to_string()).filter(|s| !s.is_empty()) {
             Some(text) => db.set_description(id, &text),
@@ -169,6 +171,18 @@ pub fn reject(p: &Paths, id: &str, note: &str) -> Result<Value, String> {
     Ok(json!({ "id": t.id }))
 }
 
+/// Stops a running task. `start` can resume it. The worktree and branch stay.
+pub fn abort(p: &Paths, id: &str) -> Result<Value, String> {
+    let db = db::open(&p.db())?;
+    let t = db.get(id)?;
+    // Status is set before the kill, so the run loop sees `stopped` when the step ends.
+    if !db.stop_running(&t.id)? {
+        return Err(format!("task {} is {}, not running", t.id, t.status));
+    }
+    agent::kill(&t.id);
+    Ok(json!({ "id": t.id }))
+}
+
 pub fn status(p: &Paths, prefix: &str) -> Result<Value, String> {
     let tasks = db::open(&p.db())?.find(prefix)?;
     serde_json::to_value(tasks).map_err(|e| e.to_string())
@@ -191,6 +205,9 @@ fn run(p: &Paths, id: &str) -> Result<(), String> {
     let db = db::open(&p.db())?;
     loop {
         let mut t = db.get(id)?;
+        if t.status != "running" {
+            return Ok(());
+        }
         let dir = PathBuf::from(&t.path);
         let cfg = config::load(p, Some(&dir))?;
         let lp = cfg.loop_named(&t.loop_name).clone();
@@ -206,12 +223,9 @@ fn run(p: &Paths, id: &str) -> Result<(), String> {
             ix::notify(&cfg, &format!("Review needed [{label}]: {}", t.label()));
             return Ok(());
         }
-        if t.iteration > lp.iterations {
-            return halt(&db, &cfg, &t, "stopped", &format!("iteration limit {} reached", lp.iterations));
-        }
         let limit = lp.time_limit_secs()?;
-        if t.loop_elapsed >= limit {
-            return halt(&db, &cfg, &t, "stopped", &format!("time limit reached in {} loop", t.loop_name));
+        if let Some(msg) = limit_halt(&lp, &t, limit) {
+            return halt(&db, &cfg, &t, "stopped", &msg);
         }
 
         let wt = PathBuf::from(t.worktree.clone().unwrap_or_else(|| t.path.clone()));
@@ -242,8 +256,16 @@ fn run(p: &Paths, id: &str) -> Result<(), String> {
             _ => None,
         };
         let prompt = build_prompt(&t, &key, output_str.as_deref(), step.kind == StepKind::Review, previous.as_deref());
-        let remaining = (limit - t.loop_elapsed) as u64;
-        let out = agent::run(&cfg, &prompt, Some(skill), &wt, Duration::from_secs(remaining))?;
+        let timeout = step_timeout(limit, t.loop_elapsed);
+        // Refuses to spawn when an abort set the task to `stopped` before the spawn.
+        let alive = || Ok(db.get(id)?.status == "running");
+        let Some(out) = agent::run(&cfg, &prompt, Some(skill), &wt, id, timeout, alive)? else {
+            return Ok(());
+        };
+        // Aborted during the step: keep the `stopped` status and do not save.
+        if db.get(id)?.status != "running" {
+            return Ok(());
+        }
 
         t.loop_elapsed += out.secs;
         db.save(&t)?;
@@ -300,6 +322,26 @@ fn run(p: &Paths, id: &str) -> Result<(), String> {
             return Ok(());
         }
         db.save(&t)?;
+    }
+}
+
+/// Halt message when a loop limit is reached, else None. `0` means no limit.
+fn limit_halt(lp: &Loop, t: &Task, limit: i64) -> Option<String> {
+    if lp.iterations > 0 && t.iteration > lp.iterations {
+        return Some(format!("iteration limit {} reached", lp.iterations));
+    }
+    if limit > 0 && t.loop_elapsed >= limit {
+        return Some(format!("time limit reached in {} loop", t.loop_name));
+    }
+    None
+}
+
+/// Agent timeout: the time left in the loop. `Duration::MAX` is no timeout, so the step runs until it ends or is aborted.
+fn step_timeout(limit: i64, loop_elapsed: i64) -> Duration {
+    if limit > 0 {
+        Duration::from_secs((limit - loop_elapsed) as u64)
+    } else {
+        Duration::MAX
     }
 }
 
@@ -485,6 +527,67 @@ mod tests {
         let got = db.get(&t.id).unwrap();
         assert_eq!(got.status, "stopped");
         assert_eq!(got.message.as_deref(), Some("iteration limit 3 reached"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn abort_stops_only_running_task() {
+        let dir = temp("abort");
+        let p = Paths { home: dir.clone(), user_config: dir.join("user.toml") };
+        let db = db::open(&p.db()).unwrap();
+        let mut t = Task::new("p", None, None, "r", "research");
+        let wt = dir.join("wt");
+        fs::create_dir_all(&wt).unwrap();
+        t.worktree = Some(wt.to_string_lossy().into_owned());
+        db.insert(&mut t).unwrap();
+        assert!(abort(&p, &t.id).unwrap_err().contains("is new, not running"));
+        assert_eq!(db.get(&t.id).unwrap().status, "new");
+        db.claim(&t.id, &["new"]).unwrap();
+        abort(&p, &t.id).unwrap();
+        let got = db.get(&t.id).unwrap();
+        assert_eq!((got.status.as_str(), got.message.as_deref()), ("stopped", Some("aborted")));
+        assert!(wt.is_dir());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn zero_limits_do_not_halt_and_set_no_timeout() {
+        let lp = |iterations, time_limit: &str| Loop { steps: vec![], iterations, time_limit: time_limit.into() };
+        let mut t = Task::new("p", None, None, "r", "research");
+        t.iteration = 99;
+        t.loop_elapsed = 99_999;
+        let limit = lp(0, "0").time_limit_secs().unwrap();
+        assert!(limit_halt(&lp(0, "0"), &t, limit).is_none());
+        assert_eq!(step_timeout(limit, t.loop_elapsed), Duration::MAX);
+
+        assert!(limit_halt(&lp(2, "0"), &t, limit).unwrap().contains("iteration limit 2"));
+        let limit = lp(0, "100").time_limit_secs().unwrap();
+        assert!(limit_halt(&lp(0, "100"), &t, limit).unwrap().contains("time limit reached"));
+        assert_eq!(step_timeout(100, 40), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn abort_during_agent_step_records_no_elapsed_or_cost() {
+        use crate::agent::tests::script;
+        let dir = temp("abort-step");
+        // Prints a cost line, then waits. Abort kills it before the step ends.
+        let bin = script(
+            "abort-step",
+            r#"echo '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"x"}],"usage":{"cost":{"total":0.5}}}}'; sleep 30"#,
+        );
+        fs::write(dir.join("user.toml"), format!("[agent]\nkind = \"pi\"\npi_path = \"{bin}\"\n")).unwrap();
+        let p = Paths { home: dir.clone(), user_config: dir.join("user.toml") };
+        let db = db::open(&p.db()).unwrap();
+        let mut t = Task::new(&dir.to_string_lossy(), None, None, "r", "research");
+        db.insert(&mut t).unwrap();
+        db.claim(&t.id, &["new"]).unwrap();
+        let (p2, id) = (p.clone(), t.id.clone());
+        let h = thread::spawn(move || run(&p2, &id));
+        thread::sleep(Duration::from_millis(300));
+        abort(&p, &t.id).unwrap();
+        h.join().unwrap().unwrap();
+        let got = db.get(&t.id).unwrap();
+        assert_eq!((got.status.as_str(), got.loop_elapsed, got.cost), ("stopped", 0, 0.0));
         fs::remove_dir_all(dir).unwrap();
     }
 

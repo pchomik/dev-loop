@@ -152,11 +152,13 @@ impl Db {
     }
 
     /// Writes run-owned columns. Cost and description have their own updates.
+    /// A `stopped` status and its message, set by abort, are kept.
     pub fn save(&self, t: &Task) -> Result<()> {
         self.0
             .execute(
-                "UPDATE tasks SET status=?2, loop_name=?3, step=?4, iteration=?5, loop_elapsed=?6,
-                 worktree=?7, review_note=?8, message=?9 WHERE id=?1",
+                "UPDATE tasks SET status=CASE WHEN status='stopped' THEN status ELSE ?2 END, loop_name=?3,
+                 step=?4, iteration=?5, loop_elapsed=?6, worktree=?7, review_note=?8,
+                 message=CASE WHEN status='stopped' THEN message ELSE ?9 END WHERE id=?1",
                 params![
                     t.id, t.status, t.loop_name, t.step, t.iteration, t.loop_elapsed,
                     t.worktree, t.review_note, t.message
@@ -183,6 +185,18 @@ impl Db {
             return Err(format!("task {} changed, retry", t.id));
         }
         Ok(Task { status: "running".into(), message: None, ..t })
+    }
+
+    /// Moves a running task to `stopped`. Returns false when the task is not running.
+    pub fn stop_running(&self, id: &str) -> Result<bool> {
+        let n = self
+            .0
+            .execute(
+                "UPDATE tasks SET status='stopped', message='aborted' WHERE id=?1 AND status='running'",
+                params![id],
+            )
+            .map_err(es)?;
+        Ok(n > 0)
     }
 
     pub fn set_status(&self, id: &str, status: &str, message: Option<&str>) -> Result<()> {
@@ -278,6 +292,21 @@ mod tests {
     }
 
     #[test]
+    fn stop_running_only_stops_running_and_save_keeps_stopped() {
+        let (db, dir) = open_temp("stop");
+        let mut t = Task::new("p", None, None, "a", "research");
+        db.insert(&mut t).unwrap();
+        assert!(!db.stop_running(&t.id).unwrap());
+        let mut running = db.claim(&t.id, &["new"]).unwrap();
+        assert!(db.stop_running(&t.id).unwrap());
+        running.loop_elapsed = 5;
+        db.save(&running).unwrap();
+        let got = db.get(&t.id).unwrap();
+        assert_eq!((got.status.as_str(), got.message.as_deref(), got.loop_elapsed), ("stopped", Some("aborted"), 5));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn get_reports_no_match_and_lists_all_on_empty_id() {
         let (db, dir) = open_temp("get");
         db.insert(&mut Task::new("p", None, None, "a", "research")).unwrap();
@@ -299,6 +328,11 @@ mod tests {
         assert_eq!(claimed.status, "running");
         assert_eq!(db.get(&t.id).unwrap().status, "running");
         assert!(db.claim(&t.id, &["new"]).unwrap_err().contains("is running"));
+
+        db.stop_running(&t.id).unwrap();
+        let resumed = db.claim(&t.id, &["new", "failed", "stopped"]).unwrap();
+        assert_eq!(resumed.status, "running");
+        assert_eq!(db.get(&t.id).unwrap().status, "running");
         fs::remove_dir_all(dir).unwrap();
     }
 

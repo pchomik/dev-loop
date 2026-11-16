@@ -72,6 +72,7 @@ pub struct Loop {
 }
 
 impl Loop {
+    /// Seconds. `0` means no time limit.
     pub fn time_limit_secs(&self) -> Result<i64, String> {
         let s = self.time_limit.as_str();
         let (num, mult) = if let Some(n) = s.strip_suffix('h') {
@@ -154,15 +155,20 @@ pub fn load(paths: &Paths, project: Option<&Path>) -> Result<Config, String> {
     }
     let cfg: Config = Value::Table(t).try_into().map_err(|e| format!("config: {e}"))?;
     for lp in [&cfg.loops.definition, &cfg.loops.execution] {
-        if lp.steps.is_empty() || lp.iterations < 1 {
-            return Err("each loop needs steps and iterations >= 1".into());
+        if lp.steps.is_empty() {
+            return Err("each loop needs steps".into());
+        }
+        if lp.iterations < 0 {
+            return Err("iterations must be 0 or more".into());
         }
         for s in &lp.steps {
             if !cfg.steps.contains_key(s) {
                 return Err(format!("loop step `{s}` is not defined under [steps]"));
             }
         }
-        lp.time_limit_secs()?;
+        if lp.time_limit_secs()? < 0 {
+            return Err(format!("time_limit `{}` must be 0 or more", lp.time_limit));
+        }
     }
     Ok(cfg)
 }
@@ -235,9 +241,14 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_zero_iterations() {
-        let err = load_user("iter", "[loops.execution]\niterations = 0\n").err().unwrap();
-        assert!(err.contains("iterations >= 1"), "{err}");
+    fn zero_limits_mean_no_limit_and_negative_is_rejected() {
+        let cfg = load_user("zero", "[loops.execution]\niterations = 0\ntime_limit = \"0\"\n").unwrap();
+        assert_eq!(cfg.loops.execution.iterations, 0);
+        assert_eq!(cfg.loops.execution.time_limit_secs().unwrap(), 0);
+        let err = load_user("iter", "[loops.execution]\niterations = -1\n").err().unwrap();
+        assert!(err.contains("iterations must be 0 or more"), "{err}");
+        let err = load_user("time", "[loops.execution]\ntime_limit = \"-5\"\n").err().unwrap();
+        assert!(err.contains("must be 0 or more"), "{err}");
     }
 
     #[test]

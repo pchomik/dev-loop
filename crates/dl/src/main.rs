@@ -48,6 +48,8 @@ enum Cmd {
         #[arg(long)]
         note: Option<String>,
     },
+    /// Stop a running task. Status becomes stopped. Start resumes it.
+    Abort { id: String },
     /// Show tasks, or one task by ID
     List { id: Option<String> },
     /// Alias for list
@@ -88,6 +90,9 @@ fn run(cmd: Cmd) -> Result<(), String> {
         }
         Cmd::Reject { id, note } => {
             send(json!({ "cmd": "reject", "id": id, "note": note.unwrap_or_default() }))?;
+        }
+        Cmd::Abort { id } => {
+            send(json!({ "cmd": "abort", "id": id }))?;
         }
         Cmd::List { id } | Cmd::Ls { id } => {
             let tasks = send(json!({ "cmd": "list", "id": id.unwrap_or_default() }))?;

@@ -48,6 +48,7 @@ skill = "qa-review"
 output = "<KEY>-qa-review.json"
 label = "in-review"
 
+# iterations = 0 or time_limit = "0" turns that limit off.
 [loops.definition]
 steps = ["research", "frd", "user-review"]
 iterations = 3

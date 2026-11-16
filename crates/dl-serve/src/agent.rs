@@ -1,11 +1,16 @@
 use crate::config::{AgentKind, Config};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Process group ID of the running agent, by task ID. `kill` sends `SIGKILL` through it.
+static RUNNING: Mutex<BTreeMap<String, i32>> = Mutex::new(BTreeMap::new());
 
 pub struct Outcome {
     pub text: String,
@@ -28,8 +33,17 @@ struct Parsed {
     error: Option<String>,
 }
 
-/// Runs one agent turn in `cwd`. Process group is killed at `timeout`.
-pub fn run(cfg: &Config, prompt: &str, skill: Option<&str>, cwd: &Path, timeout: Duration) -> Result<Outcome, String> {
+/// Runs one agent turn in `cwd` for task `id`. Process group is killed at `timeout` or by `kill`.
+/// `alive` is checked under the registry lock before spawn. Returns `None` without spawn when it is false.
+pub fn run(
+    cfg: &Config,
+    prompt: &str,
+    skill: Option<&str>,
+    cwd: &Path,
+    id: &str,
+    timeout: Duration,
+    alive: impl Fn() -> Result<bool, String>,
+) -> Result<Option<Outcome>, String> {
     let kind = cfg.agent.kind;
     let (bin, args): (&str, Vec<String>) = match kind {
         AgentKind::Pi => {
@@ -52,15 +66,25 @@ pub fn run(cfg: &Config, prompt: &str, skill: Option<&str>, cwd: &Path, timeout:
     };
 
     let start = Instant::now();
-    let mut child = Command::new(bin)
-        .args(&args)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .map_err(|e| format!("cannot start `{bin}`: {e}"))?;
+    // Check, spawn and register under one lock, so `kill` cannot miss a starting group.
+    let mut child = {
+        let mut running = RUNNING.lock().unwrap();
+        if !alive()? {
+            return Ok(None);
+        }
+        let child = Command::new(bin)
+            .args(&args)
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .map_err(|e| format!("cannot start `{bin}`: {e}"))?;
+        running.insert(id.into(), child.id() as i32);
+        child
+    };
+    let pid = child.id() as i32;
     let stdout = child.stdout.take().ok_or("no stdout")?;
     let mut stderr = child.stderr.take().ok_or("no stderr")?;
     let out_thread = thread::spawn(move || parse(kind, stdout));
@@ -83,6 +107,13 @@ pub fn run(cfg: &Config, prompt: &str, skill: Option<&str>, cwd: &Path, timeout:
         }
         thread::sleep(Duration::from_millis(100));
     };
+    {
+        let mut running = RUNNING.lock().unwrap();
+        // A describe step for the same task may have registered its own group. Keep that one.
+        if running.get(id) == Some(&pid) {
+            running.remove(id);
+        }
+    }
 
     let parsed = out_thread.join().unwrap_or_default();
     let stderr_text = err_thread.join().unwrap_or_default();
@@ -91,13 +122,21 @@ pub fn run(cfg: &Config, prompt: &str, skill: Option<&str>, cwd: &Path, timeout:
             if stderr_text.is_empty() { format!("exit {status}") } else { stderr_text }
         })
     });
-    Ok(Outcome {
+    Ok(Some(Outcome {
         text: parsed.text,
         cost: parsed.cost,
         error,
         timed_out,
         secs: start.elapsed().as_secs_f64().ceil() as i64,
-    })
+    }))
+}
+
+/// Kills the agent process group of task `id`. Does nothing when no agent runs for it.
+pub fn kill(id: &str) {
+    if let Some(&pgid) = RUNNING.lock().unwrap().get(id) {
+        // Negative PID kills the whole process group started by process_group(0).
+        unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    }
 }
 
 /// pi: `message_end` events. Cursor: final `result` event. Missing cost counts as 0 (D-004).
@@ -141,7 +180,7 @@ fn parse(kind: AgentKind, r: impl Read) -> Parsed {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::{self, Paths};
     use std::os::unix::fs::PermissionsExt;
@@ -158,7 +197,7 @@ mod tests {
     }
 
     /// Writes an executable `sh` script and returns its path.
-    fn script(name: &str, body: &str) -> String {
+    pub(crate) fn script(name: &str, body: &str) -> String {
         let dir = env::temp_dir().join(format!("dl-agent-{}-{name}", process::id()));
         fs::create_dir_all(&dir).unwrap();
         let p = dir.join("agent");
@@ -210,7 +249,7 @@ mod tests {
             "ok",
             r#"echo '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"cost":{"total":0.5}}}}'"#,
         );
-        let out = run(&cfg(AgentKind::Pi, &bin), "p", None, &env::temp_dir(), Duration::from_secs(10)).unwrap();
+        let out = run(&cfg(AgentKind::Pi, &bin), "p", None, &env::temp_dir(), "t", Duration::from_secs(10), || Ok(true)).unwrap().unwrap();
         assert!(out.ok());
         assert_eq!(out.text, "hi");
         assert_eq!(out.cost, 0.5);
@@ -219,22 +258,44 @@ mod tests {
     #[test]
     fn run_kills_agent_at_timeout() {
         let bin = script("slow", "sleep 5");
-        let out = run(&cfg(AgentKind::Pi, &bin), "p", None, &env::temp_dir(), Duration::from_secs(1)).unwrap();
+        let out = run(&cfg(AgentKind::Pi, &bin), "p", None, &env::temp_dir(), "t", Duration::from_secs(1), || Ok(true)).unwrap().unwrap();
         assert!(out.timed_out);
         assert!(!out.ok());
         assert!(out.secs < 5);
     }
 
     #[test]
+    fn kill_stops_running_agent_before_timeout() {
+        let bin = script("kill", "sleep 30");
+        let c = cfg(AgentKind::Pi, &bin);
+        let h = thread::spawn(move || run(&c, "p", None, &env::temp_dir(), "k", Duration::from_secs(60), || Ok(true)).unwrap().unwrap());
+        thread::sleep(Duration::from_millis(300));
+        kill("k");
+        let out = h.join().unwrap();
+        assert!(!out.timed_out);
+        assert!(out.secs < 10);
+    }
+
+    #[test]
+    fn run_does_not_spawn_when_not_alive() {
+        let marker = env::temp_dir().join(format!("dl-agent-{}-marker", process::id()));
+        let _ = fs::remove_file(&marker);
+        let bin = script("refuse", &format!("touch {}", marker.display()));
+        let out = run(&cfg(AgentKind::Pi, &bin), "p", None, &env::temp_dir(), "t", Duration::from_secs(10), || Ok(false)).unwrap();
+        assert!(out.is_none());
+        assert!(!marker.exists());
+    }
+
+    #[test]
     fn run_reports_stderr_on_failed_exit() {
         let bin = script("fail", "echo oops >&2; exit 3");
-        let out = run(&cfg(AgentKind::Pi, &bin), "p", None, &env::temp_dir(), Duration::from_secs(10)).unwrap();
+        let out = run(&cfg(AgentKind::Pi, &bin), "p", None, &env::temp_dir(), "t", Duration::from_secs(10), || Ok(true)).unwrap().unwrap();
         assert_eq!(out.error.as_deref(), Some("oops"));
     }
 
     #[test]
     fn run_errors_when_binary_missing() {
-        let r = run(&cfg(AgentKind::Pi, "/nonexistent/pi"), "p", None, &env::temp_dir(), Duration::from_secs(1));
+        let r = run(&cfg(AgentKind::Pi, "/nonexistent/pi"), "p", None, &env::temp_dir(), "t", Duration::from_secs(1), || Ok(true));
         assert!(r.is_err());
     }
 }

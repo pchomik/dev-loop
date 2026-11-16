@@ -20,13 +20,13 @@
 - Runs each step as an agent skill set in configuration, on pi-agent or Cursor.
 - User review step notifies you and waits for approval. No agent runs until you approve or reject.
 - Each task runs in its `--path` directory. `--create-worktree` gives a task its own git worktree named by task ID.
-- Enforces an iteration limit per loop (default `3`) and a time limit per loop (default `1h`).
+- Enforces an iteration limit per loop (default `3`) and a time limit per loop (default `1h`). Set either to `0` for no limit.
 - Checks that each step's output file exists when the step defines one.
 - Creates tasks from Jira, GitHub issue, GitLab issue or a local file.
 - Stores local state in SQLite.
 - Optional GitHub (`gh`) and GitLab (`glab`) integration: pull request and merge request creation.
 - Optional Telegram notifications.
-- Command-line client (`dl`) to create, start, approve, reject and check tasks.
+- Command-line client (`dl`) to create, start, approve, reject, abort and check tasks.
 
 ## Crates
 
@@ -71,6 +71,9 @@ Then use the client:
     # Approve or reject the user review step
     dl approve <ID>
     dl reject <ID> --note "Missing error cases"
+
+    # Stop a running task. Status becomes stopped. Start resumes it. Worktree and branch stay
+    dl abort <ID>
 
     # Show all tasks, or one task by ID
     dl list
@@ -136,7 +139,7 @@ Each step sets a `label`, and optionally a `skill` and an `output` file. `<KEY>`
 
 ### loops
 
-Set the steps of each loop, the iteration limit and the time limit.
+Set the steps of each loop, the iteration limit and the time limit. `iterations = 0` or `time_limit = "0"` turns that limit off. Quote the time limit: `"0"`, not `0`.
 
 ```toml
     [loops.definition]
