@@ -124,9 +124,12 @@ fn format_tasks(tasks: &[Value]) -> Vec<String> {
     let s = |t: &Value, k: &str| t[k].as_str().unwrap_or("-").to_string();
     let cell = |t: &Value, i: usize| -> String {
         let (k, _) = COLS[i];
-        match k {
-            "loop_name" => format!("{} ({})", s(t, "loop_name"), t["iteration"].as_i64().unwrap_or(0)),
-            "cost" => format!("${:.4}", t["cost"].as_f64().unwrap_or(0.0)),
+        let status = t["status"].as_str().unwrap_or("");
+        match (k, status) {
+            ("loop_name", "new") | ("step", "new" | "done") => "-".to_string(),
+            ("cost", "new") => "$0".to_string(),
+            ("loop_name", _) => format!("{} ({})", s(t, "loop_name"), t["iteration"].as_i64().unwrap_or(0)),
+            ("cost", _) => format!("${:.4}", t["cost"].as_f64().unwrap_or(0.0)),
             _ => s(t, k),
         }
     };
@@ -267,7 +270,7 @@ mod tests {
             json!({
                 "id": "1", "status": "new", "path": "/a", "issue": null,
                 "loop_name": "definition", "step": "research", "iteration": 1,
-                "cost": 0.0, "short_description": "First"
+                "cost": 0.5, "short_description": "First"
             }),
             json!({
                 "id": "12", "status": "running", "path": "/abc", "issue": "PROJ-1",
@@ -277,7 +280,7 @@ mod tests {
         ];
         let lines = format_tasks(&tasks);
         assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0], "id  status   path  issue   loop            step         cost     desc       ");
+        assert_eq!(lines[0], "id  status   path  issue   loop           step         cost     desc       ");
         let header = &lines[0];
         let row1 = &lines[1];
         let row2 = &lines[2];
@@ -285,7 +288,8 @@ mod tests {
         assert!(row1.starts_with("1   new"));
         assert!(row2.starts_with("12  running"));
         assert!(!header.contains("iter"));
-        assert!(row1.contains("definition (1)"));
+        assert!(row1.contains("new") && row1.contains("$0 "));
+        assert!(!row1.contains("definition") && !row1.contains("research"));
         assert!(row2.contains("execution (2)"));
         for line in &lines {
             assert!(!line.starts_with("─"));
@@ -313,7 +317,22 @@ mod tests {
         ];
         let lines = format_tasks(&tasks);
         assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0], "id  status  path  issue  loop            step      cost     desc ");
+        assert_eq!(lines[0], "id  status  path  issue  loop  step  cost  desc ");
         assert_eq!(lines[2], "    ! needs attention");
+    }
+
+    #[test]
+    fn format_tasks_shows_step_for_done_only_after_start() {
+        let task = |status: &str| {
+            json!({
+                "id": "1", "status": status, "path": "/a", "issue": null,
+                "loop_name": "execution", "step": "qa-review", "iteration": 1,
+                "cost": 0.5, "short_description": "First"
+            })
+        };
+        let done = format_tasks(&[task("done")]);
+        assert!(done[1].contains("execution (1)") && !done[1].contains("qa-review"));
+        let running = format_tasks(&[task("running")]);
+        assert!(running[1].contains("qa-review") && running[1].contains("$0.5000"));
     }
 }
