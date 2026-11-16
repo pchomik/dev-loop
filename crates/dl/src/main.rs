@@ -117,7 +117,6 @@ fn format_tasks(tasks: &[Value]) -> Vec<String> {
         ("issue", "issue"),
         ("loop_name", "loop"),
         ("step", "step"),
-        ("iteration", "iter"),
         ("cost", "cost"),
         ("short_description", "desc"),
     ];
@@ -126,7 +125,7 @@ fn format_tasks(tasks: &[Value]) -> Vec<String> {
     let cell = |t: &Value, i: usize| -> String {
         let (k, _) = COLS[i];
         match k {
-            "iteration" => t["iteration"].to_string(),
+            "loop_name" => format!("{} ({})", s(t, "loop_name"), t["iteration"].as_i64().unwrap_or(0)),
             "cost" => format!("${:.4}", t["cost"].as_f64().unwrap_or(0.0)),
             _ => s(t, k),
         }
@@ -278,13 +277,16 @@ mod tests {
         ];
         let lines = format_tasks(&tasks);
         assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0], "id  status   path  issue   loop        step         iter  cost     desc       ");
+        assert_eq!(lines[0], "id  status   path  issue   loop            step         cost     desc       ");
         let header = &lines[0];
         let row1 = &lines[1];
         let row2 = &lines[2];
         assert!(header.starts_with("id"));
         assert!(row1.starts_with("1   new"));
         assert!(row2.starts_with("12  running"));
+        assert!(!header.contains("iter"));
+        assert!(row1.contains("definition (1)"));
+        assert!(row2.contains("execution (2)"));
         for line in &lines {
             assert!(!line.starts_with("─"));
             assert!(!line.starts_with("┌"));
@@ -311,7 +313,7 @@ mod tests {
         ];
         let lines = format_tasks(&tasks);
         assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0], "id  status  path  issue  loop        step      iter  cost     desc ");
+        assert_eq!(lines[0], "id  status  path  issue  loop            step      cost     desc ");
         assert_eq!(lines[2], "    ! needs attention");
     }
 }
