@@ -51,9 +51,19 @@ enum Cmd {
     /// Stop a running task. Status becomes stopped. Start resumes it.
     Abort { id: String },
     /// Show tasks, or one task by ID
-    List { id: Option<String> },
+    List {
+        id: Option<String>,
+        /// Turn color on even when stdout is not a terminal
+        #[arg(short, long)]
+        color: bool,
+    },
     /// Alias for list
-    Ls { id: Option<String> },
+    Ls {
+        id: Option<String>,
+        /// Turn color on even when stdout is not a terminal
+        #[arg(short, long)]
+        color: bool,
+    },
 }
 
 fn main() {
@@ -94,27 +104,38 @@ fn run(cmd: Cmd) -> Result<(), String> {
         Cmd::Abort { id } => {
             send(json!({ "cmd": "abort", "id": id }))?;
         }
-        Cmd::List { id } | Cmd::Ls { id } => {
+        Cmd::List { id, color } | Cmd::Ls { id, color } => {
             let tasks = send(json!({ "cmd": "list", "id": id.unwrap_or_default() }))?;
             if let Some(arr) = tasks.as_array() {
-                print_tasks(arr);
+                print_tasks(arr, color);
             }
         }
     }
     Ok(())
 }
 
-fn print_tasks(tasks: &[Value]) {
+fn print_tasks(tasks: &[Value], force_color: bool) {
     let is_tty = unsafe { libc::isatty(1) } == 1;
-    let color = use_color(is_tty, env::var_os("NO_COLOR").is_some());
+    let color = use_color(force_color, is_tty, env::var_os("NO_COLOR").is_some());
     for line in format_tasks(tasks, color) {
         println!("{line}");
     }
 }
 
-/// Color is on only for a terminal and when `NO_COLOR` is unset.
-fn use_color(is_tty: bool, no_color: bool) -> bool {
-    is_tty && !no_color
+/// `--color` forces color on. Otherwise color is on only for a terminal and when `NO_COLOR` is unset.
+fn use_color(force_color: bool, is_tty: bool, no_color: bool) -> bool {
+    force_color || (is_tty && !no_color)
+}
+
+/// Waiting for review: the user runs `approve` or `reject`.
+fn waiting_review(t: &Value) -> bool {
+    t["status"].as_str() == Some("waiting_review")
+}
+
+/// Stopped by the iteration limit. `dl-serve` sends no reason field, so this matches the message text.
+fn iteration_limit(t: &Value) -> bool {
+    t["status"].as_str() == Some("stopped")
+        && t["message"].as_str().is_some_and(|m| m.starts_with("iteration limit ") && m.ends_with(" reached"))
 }
 
 /// ANSI color code for a status. `new` and unknown statuses stay plain.
@@ -126,6 +147,17 @@ fn status_color(status: &str) -> Option<&'static str> {
         "error" | "failed" => Some("31"),
         "stopped" => Some("35"),
         _ => None,
+    }
+}
+
+/// Marker after the status or loop text. Red when color is on.
+const MARK: &str = " [!]";
+
+/// Wrap `s` in an ANSI color code. Without a code, return `s` as is.
+fn paint(s: &str, code: Option<&str>) -> String {
+    match code {
+        Some(c) => format!("\x1b[{c}m{s}\x1b[0m"),
+        None => s.to_string(),
     }
 }
 
@@ -149,12 +181,16 @@ fn format_tasks(tasks: &[Value], color: bool) -> Vec<String> {
     let cell = |t: &Value, i: usize| -> String {
         let (k, _) = COLS[i];
         let status = t["status"].as_str().unwrap_or("");
-        match (k, status) {
+        let text = match (k, status) {
             ("loop_name", "new") | ("step", "new" | "done") => "-".to_string(),
             ("cost", "new") => "$0".to_string(),
             ("loop_name", _) => format!("{} ({})", s(t, "loop_name"), t["iteration"].as_i64().unwrap_or(0)),
             ("cost", _) => format!("${:.4}", t["cost"].as_f64().unwrap_or(0.0)),
             _ => s(t, k),
+        };
+        match (k, waiting_review(t), iteration_limit(t)) {
+            ("status", true, _) | ("loop_name", _, true) => format!("{text}{MARK}"),
+            _ => text,
         }
     };
 
@@ -179,15 +215,21 @@ fn format_tasks(tasks: &[Value], color: bool) -> Vec<String> {
         parts.clear();
         let status = t["status"].as_str().unwrap_or("");
         for (i, width) in widths.iter().enumerate() {
-            let padded = format!("{:<width$}", cell(t, i), width = *width);
+            let text = cell(t, i);
+            let padded = format!("{:<width$}", text, width = *width);
+            let code = if COLS[i].0 == "status" { status_color(status) } else { None };
             // Color wraps the padded cell, so the escape bytes do not change the width.
-            parts.push(match status_color(status) {
-                Some(code) if color && COLS[i].0 == "status" => format!("\x1b[{code}m{padded}\x1b[0m"),
+            parts.push(match text.strip_suffix(MARK) {
+                Some(body) if color => {
+                    let pad = &padded[text.len()..];
+                    format!("{} {}{pad}", paint(body, code), paint("[!]", Some("31")))
+                }
+                _ if color => paint(&padded, code),
                 _ => padded,
             });
         }
         lines.push(parts.join("  "));
-        if let Some(m) = t["message"].as_str() {
+        if let Some(m) = t["message"].as_str().filter(|_| !waiting_review(t) && !iteration_limit(t)) {
             lines.push(format!("    ! {m}"));
         }
     }
@@ -392,10 +434,40 @@ mod tests {
     }
 
     #[test]
-    fn use_color_only_for_tty_without_no_color() {
-        assert!(!use_color(false, false));
-        assert!(!use_color(true, true));
-        assert!(!use_color(false, true));
-        assert!(use_color(true, false));
+    fn format_tasks_marks_waiting_review_and_iteration_limit() {
+        let task = |status: &str, message: &str| {
+            json!({
+                "id": "1", "status": status, "path": "/a", "issue": null,
+                "loop_name": "execution", "step": "research", "iteration": 4,
+                "cost": 0.0, "short_description": "First", "message": message
+            })
+        };
+        let tasks = [
+            task("waiting_review", "Waiting for review: run `approve` or `reject`."),
+            task("stopped", "iteration limit 3 reached"),
+            task("stopped", "time limit reached in execution loop"),
+        ];
+        let plain = format_tasks(&tasks, false);
+        assert!(plain[1].contains("waiting_review [!]"));
+        assert!(plain[2].contains("execution (4) [!]"));
+        // Message lines hide for the two marked cases only.
+        assert_eq!(plain.len(), 5);
+        assert_eq!(plain[4], "    ! time limit reached in execution loop");
+        // Red [!] in both cells. Status text keeps its status color.
+        let colored = format_tasks(&tasks, true);
+        assert!(colored[1].contains("\x1b[33mwaiting_review\x1b[0m \x1b[31m[!]\x1b[0m"));
+        assert!(colored[2].contains("execution (4) \x1b[31m[!]\x1b[0m"));
+        let strip = |s: &String| s.replace("\x1b[33m", "").replace("\x1b[35m", "").replace("\x1b[31m", "").replace("\x1b[0m", "");
+        assert_eq!(colored.iter().map(strip).collect::<Vec<_>>(), plain);
+    }
+
+    #[test]
+    fn use_color_forced_or_only_for_tty_without_no_color() {
+        assert!(use_color(true, false, false));
+        assert!(use_color(true, false, true));
+        assert!(!use_color(false, false, false));
+        assert!(!use_color(false, true, true));
+        assert!(!use_color(false, false, true));
+        assert!(use_color(false, true, false));
     }
 }
