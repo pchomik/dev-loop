@@ -105,12 +105,31 @@ fn run(cmd: Cmd) -> Result<(), String> {
 }
 
 fn print_tasks(tasks: &[Value]) {
-    for line in format_tasks(tasks) {
+    let is_tty = unsafe { libc::isatty(1) } == 1;
+    let color = use_color(is_tty, env::var_os("NO_COLOR").is_some());
+    for line in format_tasks(tasks, color) {
         println!("{line}");
     }
 }
 
-fn format_tasks(tasks: &[Value]) -> Vec<String> {
+/// Color is on only for a terminal and when `NO_COLOR` is unset.
+fn use_color(is_tty: bool, no_color: bool) -> bool {
+    is_tty && !no_color
+}
+
+/// ANSI color code for a status. `new` and unknown statuses stay plain.
+fn status_color(status: &str) -> Option<&'static str> {
+    match status {
+        "running" => Some("32"),
+        "waiting_review" => Some("33"),
+        "done" => Some("34"),
+        "error" | "failed" => Some("31"),
+        "stopped" => Some("35"),
+        _ => None,
+    }
+}
+
+fn format_tasks(tasks: &[Value], color: bool) -> Vec<String> {
     if tasks.is_empty() {
         return Vec::new();
     }
@@ -158,8 +177,14 @@ fn format_tasks(tasks: &[Value]) -> Vec<String> {
     lines.push(parts.join("  "));
     for t in tasks {
         parts.clear();
+        let status = t["status"].as_str().unwrap_or("");
         for (i, width) in widths.iter().enumerate() {
-            parts.push(format!("{:<width$}", cell(t, i), width = *width));
+            let padded = format!("{:<width$}", cell(t, i), width = *width);
+            // Color wraps the padded cell, so the escape bytes do not change the width.
+            parts.push(match status_color(status) {
+                Some(code) if color && COLS[i].0 == "status" => format!("\x1b[{code}m{padded}\x1b[0m"),
+                _ => padded,
+            });
         }
         lines.push(parts.join("  "));
         if let Some(m) = t["message"].as_str() {
@@ -283,7 +308,7 @@ mod tests {
                 "cost": 0.1234, "short_description": "Second task"
             }),
         ];
-        let lines = format_tasks(&tasks);
+        let lines = format_tasks(&tasks, false);
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0], "id  status   path  issue   loop           step         cost     desc       ");
         let header = &lines[0];
@@ -320,7 +345,7 @@ mod tests {
                 "message": "needs attention"
             }),
         ];
-        let lines = format_tasks(&tasks);
+        let lines = format_tasks(&tasks, false);
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0], "id  status  path  issue  loop  step  cost  desc ");
         assert_eq!(lines[2], "    ! needs attention");
@@ -335,9 +360,42 @@ mod tests {
                 "cost": 0.5, "short_description": "First"
             })
         };
-        let done = format_tasks(&[task("done")]);
+        let done = format_tasks(&[task("done")], false);
         assert!(done[1].contains("execution (1)") && !done[1].contains("qa-review"));
-        let running = format_tasks(&[task("running")]);
+        let running = format_tasks(&[task("running")], false);
         assert!(running[1].contains("qa-review") && running[1].contains("$0.5000"));
+    }
+
+    #[test]
+    fn format_tasks_colors_status_cell_only() {
+        let task = |status: &str| {
+            json!({
+                "id": "1", "status": status, "path": "/a", "issue": null,
+                "loop_name": "definition", "step": "research", "iteration": 1,
+                "cost": 0.0, "short_description": "First"
+            })
+        };
+        let tasks = [task("running"), task("new")];
+        let plain = format_tasks(&tasks, false);
+        let colored = format_tasks(&tasks, true);
+        // Removing the color codes gives the plain output, so widths match.
+        let strip = |s: &String| s.replace("\x1b[32m", "").replace("\x1b[0m", "");
+        assert_eq!(colored.iter().map(strip).collect::<Vec<_>>(), plain);
+        // Escape codes wrap only the status cell of the running row.
+        let row = &colored[1];
+        let start = row.find("\x1b[32m").unwrap();
+        let end = row.find("\x1b[0m").unwrap() + "\x1b[0m".len();
+        assert!(row[start..end].contains("running"));
+        assert!(!row[..start].contains('\x1b'));
+        assert!(!row[end..].contains('\x1b'));
+        assert!(!colored[2].contains('\x1b'));
+    }
+
+    #[test]
+    fn use_color_only_for_tty_without_no_color() {
+        assert!(!use_color(false, false));
+        assert!(!use_color(true, true));
+        assert!(!use_color(false, true));
+        assert!(use_color(true, false));
     }
 }
