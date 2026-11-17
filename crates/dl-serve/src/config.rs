@@ -29,6 +29,9 @@ impl Paths {
     pub fn worktrees(&self) -> PathBuf {
         self.home.join("worktrees")
     }
+    pub fn log(&self, id: &str) -> PathBuf {
+        self.home.join("logs").join(format!("{id}.log"))
+    }
 }
 
 #[derive(Deserialize, Clone, Copy, PartialEq, Debug, Default)]

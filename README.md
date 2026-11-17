@@ -80,6 +80,10 @@ Then use the client:
     dl ls
     dl list <ID>
     dl ls <ID>
+
+    # Show the agent log of a task, last 100 lines. -f keeps printing new lines
+    dl logs <ID>
+    dl logs -f <ID>
 ```
 
 `--request` and `--file` are mutually exclusive. Use one of them.

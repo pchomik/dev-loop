@@ -2,11 +2,12 @@ use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use std::ffi::CString;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::{env, io, process};
+use std::time::Duration;
+use std::{env, io, process, thread};
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -64,7 +65,17 @@ enum Cmd {
         #[arg(short, long)]
         color: bool,
     },
+    /// Show the agent log of a task
+    Logs {
+        id: String,
+        /// Keep printing new lines until interrupted
+        #[arg(short, long)]
+        follow: bool,
+    },
 }
+
+/// Lines shown before follow starts, or without `--follow`.
+const TAIL_LINES: usize = 100;
 
 fn main() {
     if let Err(e) = run(Cli::parse().cmd) {
@@ -110,6 +121,7 @@ fn run(cmd: Cmd) -> Result<(), String> {
                 print_tasks(arr, color);
             }
         }
+        Cmd::Logs { id, follow } => logs(&id, follow)?,
     }
     Ok(())
 }
@@ -234,6 +246,54 @@ fn format_tasks(tasks: &[Value], color: bool) -> Vec<String> {
         }
     }
     lines
+}
+
+/// Prints the last lines of a task log. With `follow`, prints new lines until interrupted.
+/// The log is read from the data home, not from dl-serve. Follow mode needs no IPC reply.
+fn logs(id: &str, follow: bool) -> Result<(), String> {
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("invalid task id `{id}`"));
+    }
+    let path = home().join("logs").join(format!("{id}.log"));
+    let mut file = fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    let mut out = io::stdout();
+    out.write_all(last_lines(&String::from_utf8_lossy(&bytes), TAIL_LINES).as_bytes()).map_err(|e| e.to_string())?;
+    if follow {
+        loop {
+            thread::sleep(Duration::from_millis(200));
+            let new = read_new(&mut file, &mut bytes).map_err(|e| e.to_string())?;
+            out.write_all(&new).and_then(|_| out.flush()).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Returns the log bytes added since the last read and updates `seen`.
+/// Compares the whole file with `seen`. A change inside `seen` means `Log::finish`
+/// replaced streamed text. Then returns the lines from the first changed line on,
+/// so the reader sees the final text. Re-reads the file each poll: a ceiling for huge logs.
+fn read_new(file: &mut fs::File, seen: &mut Vec<u8>) -> io::Result<Vec<u8>> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut now = Vec::new();
+    file.read_to_end(&mut now)?;
+    let common = seen.iter().zip(&now).take_while(|(a, b)| a == b).count();
+    // Pure append resumes at the old end. A change starts at its line boundary so the line prints whole.
+    let from = if common == seen.len() {
+        common
+    } else {
+        seen[..common].iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1)
+    };
+    let new = now[from..].to_vec();
+    *seen = now;
+    Ok(new)
+}
+
+/// The last `n` lines of `text`. A line without a newline at the end counts as a line.
+fn last_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    lines[lines.len().saturating_sub(n)..].concat()
 }
 
 fn home() -> PathBuf {
@@ -459,6 +519,48 @@ mod tests {
         assert!(colored[2].contains("execution (4) \x1b[31m[!]\x1b[0m"));
         let strip = |s: &String| s.replace("\x1b[33m", "").replace("\x1b[35m", "").replace("\x1b[31m", "").replace("\x1b[0m", "");
         assert_eq!(colored.iter().map(strip).collect::<Vec<_>>(), plain);
+    }
+
+    #[test]
+    fn last_lines_keeps_last_n_lines_and_partial_line() {
+        let text: String = (1..=250).map(|i| format!("line {i}\n")).collect();
+        let tail = last_lines(&text, TAIL_LINES);
+        assert!(tail.starts_with("line 151\n") && tail.ends_with("line 250\n"));
+        assert_eq!(tail.lines().count(), TAIL_LINES);
+        assert_eq!(last_lines("a\nb\npartial", 2), "b\npartial");
+    }
+
+    #[test]
+    fn read_new_follows_appends_and_replace() {
+        let path = temp("follow").join("task.log");
+        fs::write(&path, "=== step ===\nHello, this is long\n").unwrap();
+        let mut file = fs::File::open(&path).unwrap();
+        let mut seen = Vec::new();
+        file.read_to_end(&mut seen).unwrap();
+        fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"next\n").unwrap();
+        assert_eq!(read_new(&mut file, &mut seen).unwrap(), b"next\n");
+        // Replace the streamed line with a shorter final text, as Log::finish does.
+        fs::write(&path, "=== step ===\nHi\nnext\n").unwrap();
+        assert_eq!(read_new(&mut file, &mut seen).unwrap(), b"Hi\nnext\n");
+        fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"more\n").unwrap();
+        assert_eq!(read_new(&mut file, &mut seen).unwrap(), b"more\n");
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn read_new_follows_longer_and_same_length_replace() {
+        let path = temp("follow-replace").join("task.log");
+        fs::write(&path, "=== step ===\nHi\n").unwrap();
+        let mut file = fs::File::open(&path).unwrap();
+        let mut seen = Vec::new();
+        file.read_to_end(&mut seen).unwrap();
+        // Longer replace of the streamed line.
+        fs::write(&path, "=== step ===\nHello there, longer final text\nmore\n").unwrap();
+        assert_eq!(read_new(&mut file, &mut seen).unwrap(), b"Hello there, longer final text\nmore\n");
+        // Same-length replace: only characters change.
+        fs::write(&path, "=== step ===\nHEllo there, longer final text\nmore\n").unwrap();
+        assert_eq!(read_new(&mut file, &mut seen).unwrap(), b"HEllo there, longer final text\nmore\n");
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]

@@ -2,6 +2,7 @@ mod agent;
 mod config;
 mod db;
 mod integrations;
+mod log;
 mod ipc;
 mod runner;
 

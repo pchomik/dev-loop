@@ -125,7 +125,7 @@ fn describe(p: &Paths, id: &str) {
             "Write a short description of this development task in at most 8 words. Do not use tools. Reply with only the description.\n\nRequest:\n{}",
             t.request
         );
-        let Some(out) = agent::run(&cfg, &prompt, None, &dir, id, Duration::from_secs(300), || Ok(true))? else {
+        let Some(out) = agent::run(&cfg, &prompt, None, &dir, id, &p.log(id), Duration::from_secs(300), || Ok(true))? else {
             return Ok(());
         };
         db.add_cost(id, out.cost)?;
@@ -259,7 +259,7 @@ fn run(p: &Paths, id: &str) -> Result<(), String> {
         let timeout = step_timeout(limit, t.loop_elapsed);
         // Refuses to spawn when an abort set the task to `stopped` before the spawn.
         let alive = || Ok(db.get(id)?.status == "running");
-        let Some(out) = agent::run(&cfg, &prompt, Some(skill), &wt, id, timeout, alive)? else {
+        let Some(out) = agent::run(&cfg, &prompt, Some(skill), &wt, id, &p.log(id), timeout, alive)? else {
             return Ok(());
         };
         // Aborted during the step: keep the `stopped` status and do not save.
