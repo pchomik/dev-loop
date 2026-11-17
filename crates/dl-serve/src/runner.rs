@@ -599,7 +599,7 @@ mod tests {
         db.insert(&mut t).unwrap();
         abort(&p, &t.id).unwrap();
         let got = db.get(&t.id).unwrap();
-        assert_eq!((got.status.as_str(), got.message.as_deref()), ("aborted", Some("aborted")));
+        assert_eq!((got.status.as_str(), got.message.as_deref()), ("aborted", None));
         for status in ["waiting_review", "failed", "stopped", "done"] {
             db.set_status(&t.id, status, None).unwrap();
             abort(&p, &t.id).unwrap();

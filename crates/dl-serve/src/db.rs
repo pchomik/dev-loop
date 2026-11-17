@@ -140,6 +140,8 @@ pub fn open(path: &Path) -> Result<Db> {
         )
         .map_err(es)?;
     }
+    // Aborts before `set_aborted` stopped storing a message left `aborted` behind. Clear it.
+    c.execute("UPDATE tasks SET message=NULL WHERE status='aborted' AND message='aborted'", []).map_err(es)?;
     Ok(Db(c))
 }
 
@@ -218,7 +220,7 @@ impl Db {
     /// Moves a task in any status to `aborted`.
     pub fn set_aborted(&self, id: &str) -> Result<()> {
         self.0
-            .execute("UPDATE tasks SET status='aborted', message='aborted' WHERE id=?1", params![id])
+            .execute("UPDATE tasks SET status='aborted', message=NULL WHERE id=?1", params![id])
             .map_err(es)?;
         Ok(())
     }
@@ -342,7 +344,7 @@ mod tests {
         Connection::open(&path)
             .unwrap()
             .execute_batch(
-                "CREATE TABLE tasks (id INTEGER PRIMARY KEY, issue TEXT, source TEXT, created_at INTEGER NOT NULL);
+                "CREATE TABLE tasks (id INTEGER PRIMARY KEY, issue TEXT, source TEXT, status TEXT, message TEXT, created_at INTEGER NOT NULL);
                  INSERT INTO tasks (id, issue, source, created_at) VALUES (1, NULL, NULL, 0), (2, 'PROJ-1', NULL, 0);",
             )
             .unwrap();
@@ -372,7 +374,20 @@ mod tests {
         running.loop_elapsed = 5;
         db.save(&running).unwrap();
         let got = db.get(&t.id).unwrap();
-        assert_eq!((got.status.as_str(), got.message.as_deref(), got.loop_elapsed), ("aborted", Some("aborted"), 5));
+        assert_eq!((got.status.as_str(), got.message.as_deref(), got.loop_elapsed), ("aborted", None, 5));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn open_clears_old_aborted_message() {
+        let (db, dir) = open_temp("old-abort");
+        let mut t = Task::new("p", None, None, "a", "research");
+        db.insert(&mut t).unwrap();
+        db.set_status(&t.id, "aborted", Some("aborted")).unwrap();
+        drop(db);
+        let db = open(&dir.join("sub/state.db")).unwrap();
+        let got = db.get(&t.id).unwrap();
+        assert_eq!((got.status.as_str(), got.message.as_deref()), ("aborted", None));
         fs::remove_dir_all(dir).unwrap();
     }
 
