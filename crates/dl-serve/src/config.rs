@@ -56,6 +56,8 @@ pub struct Agent {
     pub kind: AgentKind,
     pub pi_path: String,
     pub cursor_path: String,
+    pub pi_args: Vec<String>,
+    pub cursor_args: Vec<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -252,6 +254,13 @@ mod tests {
         assert!(err.contains("iterations must be 0 or more"), "{err}");
         let err = load_user("time", "[loops.execution]\ntime_limit = \"-5\"\n").err().unwrap();
         assert!(err.contains("must be 0 or more"), "{err}");
+    }
+
+    #[test]
+    fn agent_args_default_to_empty_when_unset() {
+        let cfg = load_user("args", "[agent]\nkind = \"pi\"\npi_path = \"pi\"\n").unwrap();
+        assert!(cfg.agent.pi_args.is_empty());
+        assert!(cfg.agent.cursor_args.is_empty());
     }
 
     #[test]

@@ -112,7 +112,11 @@ Choose the agent and set the binary paths.
     kind = "pi"              # pi | cursor
     pi_path = "pi"
     cursor_path = "cursor-agent"
+    pi_args = []             # extra args for pi, before the prompt
+    cursor_args = []         # extra args for cursor-agent, before the prompt
 ```
+
+`pi_args` and `cursor_args` apply to every agent call. Example: `pi_args = ["--trust"]`.
 
 </details>
 

@@ -602,6 +602,27 @@ mod tests {
     }
 
     #[test]
+    fn describe_passes_pi_args_to_agent() {
+        use crate::agent::tests::script;
+        let _lock = agent_lock();
+        let dir = temp("describe-args");
+        let argv = dir.join("argv.txt");
+        let bin = script(
+            "describe-args",
+            &format!(r#"printf '%s\n' "$@" > {}; echo '{{"type":"message_end","message":{{"role":"assistant","content":[{{"type":"text","text":"Short"}}]}}}}'"#, argv.display()),
+        );
+        fs::write(dir.join("user.toml"), format!("[agent]\nkind = \"pi\"\npi_path = \"{bin}\"\npi_args = [\"--trust\"]\n")).unwrap();
+        let p = Paths { home: dir.clone(), user_config: dir.join("user.toml") };
+        let db = db::open(&p.db()).unwrap();
+        let mut t = Task::new(&dir.to_string_lossy(), None, None, "r", "research");
+        db.insert(&mut t).unwrap();
+        describe(&p, &t.id);
+        assert!(fs::read_to_string(&argv).unwrap().lines().any(|l| l == "--trust"));
+        assert_eq!(db.get(&t.id).unwrap().short_description.as_deref(), Some("Short"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn completed_agent_step_adds_run_secs() {
         use crate::agent::tests::script;
         let _lock = agent_lock();

@@ -49,13 +49,13 @@ pub fn run(
     alive: impl Fn() -> Result<bool, String>,
 ) -> Result<Option<Outcome>, String> {
     let kind = cfg.agent.kind;
-    let (bin, args): (&str, Vec<String>) = match kind {
+    let (bin, mut args, extra, msg): (&str, Vec<String>, &[String], String) = match kind {
         AgentKind::Pi => {
             let msg = match skill {
                 Some(s) => format!("/skill:{s} {prompt}"),
                 None => prompt.to_string(),
             };
-            (&cfg.agent.pi_path, vec!["--mode".into(), "json".into(), "--no-session".into(), msg])
+            (&cfg.agent.pi_path, vec!["--mode".into(), "json".into(), "--no-session".into()], &cfg.agent.pi_args, msg)
         }
         AgentKind::Cursor => {
             let msg = match skill {
@@ -64,10 +64,15 @@ pub fn run(
             };
             (
                 &cfg.agent.cursor_path,
-                vec!["-p".into(), "--output-format".into(), "stream-json".into(), "--force".into(), msg],
+                vec!["-p".into(), "--output-format".into(), "stream-json".into(), "--force".into()],
+                &cfg.agent.cursor_args,
+                msg,
             )
         }
     };
+    // Extra args go after the fixed flags and before the prompt.
+    args.extend(extra.iter().cloned());
+    args.push(msg);
 
     let mut log = Log::open(log_path)?;
     let mut parser_log = Log::open(log_path)?;
@@ -312,6 +317,37 @@ pub(crate) mod tests {
         let out = h.join().unwrap();
         assert!(!out.timed_out);
         assert!(out.secs < 10);
+    }
+
+    #[test]
+    fn run_puts_extra_args_before_prompt() {
+        let out_file = env::temp_dir().join(format!("dl-agent-{}-argv.txt", process::id()));
+        let bin = script("argv", &format!("printf '%s\\n' \"$@\" > {}", out_file.display()));
+        let mut c = cfg(AgentKind::Pi, &bin);
+        c.agent.pi_args = vec!["--trust".into()];
+        run(&c, "p", None, &env::temp_dir(), "t", &log_file(), Duration::from_secs(10), || Ok(true)).unwrap().unwrap();
+        assert_eq!(fs::read_to_string(&out_file).unwrap(), "--mode\njson\n--no-session\n--trust\np\n");
+        fs::remove_file(out_file).unwrap();
+    }
+
+    #[test]
+    fn run_argv_is_unchanged_when_extra_args_empty() {
+        let out_file = env::temp_dir().join(format!("dl-agent-{}-empty-argv.txt", process::id()));
+        let bin = script("empty-argv", &format!("printf '%s\\n' \"$@\" > {}", out_file.display()));
+        run(&cfg(AgentKind::Pi, &bin), "p", None, &env::temp_dir(), "t", &log_file(), Duration::from_secs(10), || Ok(true)).unwrap().unwrap();
+        assert_eq!(fs::read_to_string(&out_file).unwrap(), "--mode\njson\n--no-session\np\n");
+        fs::remove_file(out_file).unwrap();
+    }
+
+    #[test]
+    fn run_puts_cursor_args_before_prompt() {
+        let out_file = env::temp_dir().join(format!("dl-agent-{}-cursor-argv.txt", process::id()));
+        let bin = script("cursor-argv", &format!("printf '%s\\n' \"$@\" > {}", out_file.display()));
+        let mut c = cfg(AgentKind::Cursor, &bin);
+        c.agent.cursor_args = vec!["--trust".into()];
+        run(&c, "p", None, &env::temp_dir(), "t", &log_file(), Duration::from_secs(10), || Ok(true)).unwrap().unwrap();
+        assert_eq!(fs::read_to_string(&out_file).unwrap(), "-p\n--output-format\nstream-json\n--force\n--trust\np\n");
+        fs::remove_file(out_file).unwrap();
     }
 
     #[test]

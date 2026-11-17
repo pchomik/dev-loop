@@ -4,6 +4,8 @@
 kind = "pi"
 pi_path = "pi"
 cursor_path = "cursor-agent"
+pi_args = []           # extra args before the prompt, e.g. ["--trust"]
+cursor_args = []
 
 [steps.research]
 skill = "create-research"
