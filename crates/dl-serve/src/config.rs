@@ -131,6 +131,11 @@ pub struct Markdown {
 }
 
 #[derive(Deserialize, Clone)]
+pub struct Task {
+    pub prefix: String,
+}
+
+#[derive(Deserialize, Clone)]
 pub struct Config {
     pub agent: Agent,
     pub steps: BTreeMap<String, Step>,
@@ -139,6 +144,7 @@ pub struct Config {
     pub gitlab: Gitlab,
     pub telegram: Telegram,
     pub markdown: Markdown,
+    pub task: Task,
 }
 
 impl Config {
@@ -269,5 +275,12 @@ mod tests {
         assert_eq!(cfg.loop_named("definition").steps[0], "research");
         assert_eq!(cfg.loop_named("execution").steps[0], "development");
         assert_eq!(cfg.loop_named("other").steps[0], "development");
+    }
+
+    #[test]
+    fn task_prefix_defaults_to_task_and_can_be_set() {
+        assert_eq!(load_user("prefix-default", "").unwrap().task.prefix, "TASK-");
+        let cfg = load_user("prefix-set", "[task]\nprefix = \"PROJ-\"\n").unwrap();
+        assert_eq!(cfg.task.prefix, "PROJ-");
     }
 }

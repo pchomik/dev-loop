@@ -76,6 +76,9 @@ enabled = false
 token = ""
 chat_id = ""
 
+[task]
+prefix = "TASK-"   # key for tasks with no source and no issue: <prefix><task ID>
+
 [markdown]
 dir = ".features"      # folder for <KEY>/ documents, relative to the repo root
 repo = ""              # empty: task worktree. Path to another git repo (relative to project dir or absolute)

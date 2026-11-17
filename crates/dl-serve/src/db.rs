@@ -27,10 +27,11 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS tasks (
     review_note TEXT,
     message TEXT,
     created_at INTEGER NOT NULL,
-    run_secs INTEGER NOT NULL DEFAULT 0
+    run_secs INTEGER NOT NULL DEFAULT 0,
+    key TEXT
 );";
 
-const COLS: &str = "id, path, issue, source, request, short_description, status, loop_name, step, iteration, loop_elapsed, cost, worktree, review_note, message, created_at, run_secs";
+const COLS: &str = "id, path, issue, source, request, short_description, status, loop_name, step, iteration, loop_elapsed, cost, worktree, review_note, message, created_at, run_secs, key";
 
 #[derive(Serialize, Clone, Debug)]
 pub struct Task {
@@ -54,6 +55,8 @@ pub struct Task {
     pub created_at: i64,
     /// Agent run seconds of all completed steps, across loops.
     pub run_secs: i64,
+    /// Folder name and commit key. Set on the first run and kept after a prefix change.
+    pub key: Option<String>,
 }
 
 impl Task {
@@ -80,6 +83,7 @@ impl Task {
             message: None,
             created_at,
             run_secs: 0,
+            key: None,
         }
     }
 
@@ -107,6 +111,7 @@ fn from_row(r: &Row) -> rusqlite::Result<Task> {
         message: r.get(14)?,
         created_at: r.get(15)?,
         run_secs: r.get(16)?,
+        key: r.get(17)?,
     })
 }
 
@@ -124,6 +129,17 @@ pub fn open(path: &Path) -> Result<Db> {
     if has_run_secs == 0 {
         c.execute_batch("ALTER TABLE tasks ADD COLUMN run_secs INTEGER NOT NULL DEFAULT 0").map_err(es)?;
     }
+    let has_key: i64 = c
+        .query_row("SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name='key'", [], |r| r.get(0))
+        .map_err(es)?;
+    if has_key == 0 {
+        // Tasks before the prefix change keep their bare ID. Only a prefix changes the key of no-issue, no-source tasks.
+        c.execute_batch(
+            "ALTER TABLE tasks ADD COLUMN key TEXT;
+             UPDATE tasks SET key = CAST(id AS TEXT) WHERE issue IS NULL AND source IS NULL;",
+        )
+        .map_err(es)?;
+    }
     Ok(Db(c))
 }
 
@@ -132,11 +148,11 @@ impl Db {
     pub fn insert(&self, t: &mut Task) -> Result<()> {
         self.0
             .execute(
-                &format!("INSERT INTO tasks ({COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)"),
+                &format!("INSERT INTO tasks ({COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)"),
                 params![
                     None::<i64>, t.path, t.issue, t.source, t.request, t.short_description, t.status,
                     t.loop_name, t.step, t.iteration, t.loop_elapsed, t.cost, t.worktree,
-                    t.review_note, t.message, t.created_at, t.run_secs
+                    t.review_note, t.message, t.created_at, t.run_secs, t.key
                 ],
             )
             .map_err(es)?;
@@ -214,6 +230,13 @@ impl Db {
     pub fn set_status(&self, id: &str, status: &str, message: Option<&str>) -> Result<()> {
         self.0
             .execute("UPDATE tasks SET status=?2, message=?3 WHERE id=?1", params![id, status, message])
+            .map_err(es)?;
+        Ok(())
+    }
+
+    pub fn set_key(&self, id: &str, key: &str) -> Result<()> {
+        self.0
+            .execute("UPDATE tasks SET key=?2 WHERE id=?1", params![id, key])
             .map_err(es)?;
         Ok(())
     }
@@ -322,7 +345,10 @@ mod tests {
         let path = dir.join("state.db");
         Connection::open(&path)
             .unwrap()
-            .execute_batch("CREATE TABLE tasks (id INTEGER PRIMARY KEY, created_at INTEGER NOT NULL);")
+            .execute_batch(
+                "CREATE TABLE tasks (id INTEGER PRIMARY KEY, issue TEXT, source TEXT, created_at INTEGER NOT NULL);
+                 INSERT INTO tasks (id, issue, source, created_at) VALUES (1, NULL, NULL, 0), (2, 'PROJ-1', NULL, 0);",
+            )
             .unwrap();
         open(&path).unwrap();
         let db = open(&path).unwrap();
@@ -331,6 +357,10 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name='run_secs'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1);
+        let key = |id: i64| -> Option<String> { db.0.query_row("SELECT key FROM tasks WHERE id=?1", [id], |r| r.get(0)).unwrap() };
+        // Only the no-issue, no-source row keeps its bare ID as key.
+        assert_eq!(key(1).as_deref(), Some("1"));
+        assert_eq!(key(2), None);
         fs::remove_dir_all(dir).unwrap();
     }
 

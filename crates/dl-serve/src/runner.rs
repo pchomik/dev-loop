@@ -230,7 +230,10 @@ fn run(p: &Paths, id: &str) -> Result<(), String> {
 
         let wt = PathBuf::from(t.worktree.clone().unwrap_or_else(|| t.path.clone()));
 
-        let key = key(&t);
+        let key = key(&t, &cfg.task.prefix);
+        if t.key.is_none() {
+            db.set_key(id, &key)?;
+        }
         // Documents go to the markdown repo, or to the worktree when `repo` is empty.
         let docs_root = match cfg.markdown.repo.as_str() {
             "" => wt.clone(),
@@ -389,12 +392,17 @@ fn branch(id: &str) -> String {
     format!("dev-loop/{id}")
 }
 
-/// `<KEY>` is the issue ID, or the task ID when no issue is set.
-fn key(t: &Task) -> String {
-    t.issue
-        .as_deref()
-        .unwrap_or(&t.id)
-        .chars()
+/// `<KEY>` is the stored key, else the issue ID. With no issue and no source it is `<prefix><task ID>`. Otherwise it is the task ID.
+fn key(t: &Task, prefix: &str) -> String {
+    if let Some(stored) = &t.key {
+        return stored.clone();
+    }
+    let raw = match &t.issue {
+        Some(issue) => issue.clone(),
+        None if t.source.is_none() => format!("{prefix}{}", t.id),
+        None => t.id.clone(),
+    };
+    raw.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
         .collect()
 }
@@ -448,11 +456,53 @@ mod tests {
     #[test]
     fn key_is_issue_or_task_id_with_unsafe_chars_replaced() {
         let with_issue = Task::new("p", Some("PROJ-12"), None, "r", "research");
-        assert_eq!(key(&with_issue), "PROJ-12");
-        assert_eq!(key(&Task::new("p", Some("a/b c"), None, "r", "research")), "a-b-c");
+        assert_eq!(key(&with_issue, "TASK-"), "PROJ-12");
+        assert_eq!(key(&Task::new("p", Some("a/b c"), None, "r", "research"), "TASK-"), "a-b-c");
         let mut no_issue = Task::new("p", None, None, "r", "research");
         no_issue.id = "7".into();
-        assert_eq!(key(&no_issue), "7");
+        assert_eq!(key(&no_issue, "TASK-"), "TASK-7");
+        assert_eq!(key(&no_issue, "a/b "), "a-b-7");
+        let mut source_only = Task::new("p", None, Some("file"), "r", "research");
+        source_only.id = "7".into();
+        assert_eq!(key(&source_only, "TASK-"), "7");
+        // A key stored on the first run wins over a later prefix change.
+        no_issue.key = Some("7".into());
+        assert_eq!(key(&no_issue, "PROJ-"), "7");
+    }
+
+    #[test]
+    fn run_uses_prefixed_key_for_folder_prompt_and_commit() {
+        use crate::agent::tests::script;
+        let _lock = agent_lock();
+        let dir = temp("prefixed-key");
+        let argv = dir.join("argv.txt");
+        // Writes the documents of the first two steps under the expected folder and records the prompt.
+        let bin = script(
+            "prefixed-key",
+            &format!(
+                r#"mkdir -p .features/TASK-1 && echo x > .features/TASK-1/TASK-1-research.md && echo x > .features/TASK-1/TASK-1-frd.md && printf '%s\n' "$@" > {}; echo '{{"type":"message_end","message":{{"role":"assistant","content":[{{"type":"text","text":"x"}}]}}}}'"#,
+                argv.display()
+            ),
+        );
+        fs::write(dir.join("user.toml"), format!("[agent]\nkind = \"pi\"\npi_path = \"{bin}\"\n[markdown]\nauto_commit = true\n")).unwrap();
+        let git = |args: &[&str]| process::Command::new("git").current_dir(&dir).args(args).output().unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        let p = Paths { home: dir.clone(), user_config: dir.join("user.toml") };
+        let db = db::open(&p.db()).unwrap();
+        let mut t = Task::new(&dir.to_string_lossy(), None, None, "r", "research");
+        db.insert(&mut t).unwrap();
+        db.claim(&t.id, &["new"]).unwrap();
+        run(&p, &t.id).unwrap();
+        let got = db.get(&t.id).unwrap();
+        // Stops at the user review after the frd step, so both documents were created.
+        assert_eq!((got.status.as_str(), got.key.as_deref()), ("waiting_review", Some("TASK-1")));
+        // The first prompt line follows the `/skill:` prefix, so match the line end.
+        assert!(fs::read_to_string(&argv).unwrap().contains("Task key: TASK-1\n"));
+        let log = git(&["log", "--format=%s"]);
+        assert_eq!(String::from_utf8_lossy(&log.stdout), "dev-loop: frd TASK-1\ndev-loop: research TASK-1\n");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
