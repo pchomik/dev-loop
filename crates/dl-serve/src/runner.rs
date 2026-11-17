@@ -270,6 +270,7 @@ fn run(p: &Paths, id: &str) -> Result<(), String> {
         t.loop_elapsed += out.secs;
         db.save(&t)?;
         db.add_cost(id, out.cost)?;
+        db.add_run_secs(id, out.secs)?;
         if out.timed_out {
             return halt(&db, &cfg, &t, "stopped", &format!("time limit reached in step `{}`", t.step));
         }
@@ -432,6 +433,13 @@ mod tests {
         d
     }
 
+    /// Serializes tests that abort or spawn agents. `agent::RUNNING` is keyed by task ID, and these tests use ID `1`.
+    static AGENT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn agent_lock() -> std::sync::MutexGuard<'static, ()> {
+        AGENT_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn defaults() -> Config {
         let paths = Paths { home: env::temp_dir(), user_config: PathBuf::from("/nonexistent/dl.toml") };
         config::load(&paths, None).unwrap()
@@ -532,6 +540,7 @@ mod tests {
 
     #[test]
     fn abort_stops_only_running_task() {
+        let _lock = agent_lock();
         let dir = temp("abort");
         let p = Paths { home: dir.clone(), user_config: dir.join("user.toml") };
         let db = db::open(&p.db()).unwrap();
@@ -569,6 +578,7 @@ mod tests {
     #[test]
     fn abort_during_agent_step_records_no_elapsed_or_cost() {
         use crate::agent::tests::script;
+        let _lock = agent_lock();
         let dir = temp("abort-step");
         // Prints a cost line, then waits. Abort kills it before the step ends.
         let bin = script(
@@ -587,7 +597,30 @@ mod tests {
         abort(&p, &t.id).unwrap();
         h.join().unwrap().unwrap();
         let got = db.get(&t.id).unwrap();
-        assert_eq!((got.status.as_str(), got.loop_elapsed, got.cost), ("stopped", 0, 0.0));
+        assert_eq!((got.status.as_str(), got.loop_elapsed, got.cost, got.run_secs), ("stopped", 0, 0.0, 0));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn completed_agent_step_adds_run_secs() {
+        use crate::agent::tests::script;
+        let _lock = agent_lock();
+        let dir = temp("run-secs");
+        let bin = script(
+            "run-secs",
+            r#"echo '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"x"}],"usage":{"cost":{"total":0.5}}}}'"#,
+        );
+        fs::write(dir.join("user.toml"), format!("[agent]\nkind = \"pi\"\npi_path = \"{bin}\"\n")).unwrap();
+        let p = Paths { home: dir.clone(), user_config: dir.join("user.toml") };
+        let db = db::open(&p.db()).unwrap();
+        let mut t = Task::new(&dir.to_string_lossy(), None, None, "r", "research");
+        db.insert(&mut t).unwrap();
+        db.claim(&t.id, &["new"]).unwrap();
+        run(&p, &t.id).unwrap();
+        let got = db.get(&t.id).unwrap();
+        assert_eq!(got.cost, 0.5);
+        assert!(got.loop_elapsed > 0);
+        assert_eq!(got.run_secs, got.loop_elapsed);
         fs::remove_dir_all(dir).unwrap();
     }
 

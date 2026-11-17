@@ -26,10 +26,11 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS tasks (
     worktree TEXT,
     review_note TEXT,
     message TEXT,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    run_secs INTEGER NOT NULL DEFAULT 0
 );";
 
-const COLS: &str = "id, path, issue, source, request, short_description, status, loop_name, step, iteration, loop_elapsed, cost, worktree, review_note, message, created_at";
+const COLS: &str = "id, path, issue, source, request, short_description, status, loop_name, step, iteration, loop_elapsed, cost, worktree, review_note, message, created_at, run_secs";
 
 #[derive(Serialize, Clone, Debug)]
 pub struct Task {
@@ -51,6 +52,8 @@ pub struct Task {
     pub review_note: Option<String>,
     pub message: Option<String>,
     pub created_at: i64,
+    /// Agent run seconds of all completed steps, across loops.
+    pub run_secs: i64,
 }
 
 impl Task {
@@ -76,6 +79,7 @@ impl Task {
             review_note: None,
             message: None,
             created_at,
+            run_secs: 0,
         }
     }
 
@@ -102,6 +106,7 @@ fn from_row(r: &Row) -> rusqlite::Result<Task> {
         review_note: r.get(13)?,
         message: r.get(14)?,
         created_at: r.get(15)?,
+        run_secs: r.get(16)?,
     })
 }
 
@@ -112,6 +117,13 @@ pub fn open(path: &Path) -> Result<Db> {
     let c = Connection::open(path).map_err(es)?;
     c.busy_timeout(Duration::from_secs(5)).map_err(es)?;
     c.execute_batch(SCHEMA).map_err(es)?;
+    // `CREATE TABLE IF NOT EXISTS` skips an existing table, so add the column it lacks.
+    let has_run_secs: i64 = c
+        .query_row("SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name='run_secs'", [], |r| r.get(0))
+        .map_err(es)?;
+    if has_run_secs == 0 {
+        c.execute_batch("ALTER TABLE tasks ADD COLUMN run_secs INTEGER NOT NULL DEFAULT 0").map_err(es)?;
+    }
     Ok(Db(c))
 }
 
@@ -120,11 +132,11 @@ impl Db {
     pub fn insert(&self, t: &mut Task) -> Result<()> {
         self.0
             .execute(
-                &format!("INSERT INTO tasks ({COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)"),
+                &format!("INSERT INTO tasks ({COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)"),
                 params![
                     None::<i64>, t.path, t.issue, t.source, t.request, t.short_description, t.status,
                     t.loop_name, t.step, t.iteration, t.loop_elapsed, t.cost, t.worktree,
-                    t.review_note, t.message, t.created_at
+                    t.review_note, t.message, t.created_at, t.run_secs
                 ],
             )
             .map_err(es)?;
@@ -220,6 +232,13 @@ impl Db {
         Ok(())
     }
 
+    pub fn add_run_secs(&self, id: &str, secs: i64) -> Result<()> {
+        self.0
+            .execute("UPDATE tasks SET run_secs = run_secs + ?2 WHERE id=?1", params![id, secs])
+            .map_err(es)?;
+        Ok(())
+    }
+
     /// True when another task in the same checkout (no worktree) is running or waits for review.
     pub fn busy_in_checkout(&self, path: &str, id: &str) -> Result<bool> {
         let n: i64 = self
@@ -269,6 +288,7 @@ mod tests {
         assert_eq!(got.request, "do it");
         assert_eq!(got.issue.as_deref(), Some("PROJ-1"));
         assert_eq!(got.status, "new");
+        assert_eq!(got.run_secs, 0);
         assert_eq!(got.loop_name, "definition");
         assert_eq!(got.step, "research");
         assert_eq!(got.label(), t.id);
@@ -279,6 +299,9 @@ mod tests {
         let mut got = db.get(&t.id).unwrap();
         assert_eq!(got.label(), "short");
         assert_eq!(got.cost, 0.75);
+        db.add_run_secs(&t.id, 12).unwrap();
+        db.add_run_secs(&t.id, 3).unwrap();
+        assert_eq!(db.get(&t.id).unwrap().run_secs, 15);
 
         got.status = "waiting_review".into();
         got.iteration = 2;
@@ -288,6 +311,26 @@ mod tests {
         assert_eq!(saved.status, "waiting_review");
         assert_eq!(saved.iteration, 2);
         assert_eq!(saved.worktree.as_deref(), Some("/wt"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn open_adds_run_secs_to_old_table_once() {
+        let dir = std::env::temp_dir().join(format!("dl-db-{}-migrate", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.db");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE tasks (id INTEGER PRIMARY KEY, created_at INTEGER NOT NULL);")
+            .unwrap();
+        open(&path).unwrap();
+        let db = open(&path).unwrap();
+        let n: i64 = db
+            .0
+            .query_row("SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name='run_secs'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -173,6 +173,15 @@ fn paint(s: &str, code: Option<&str>) -> String {
     }
 }
 
+/// `MM:SS` under one hour, `HH:MM` from one hour. Hours are not capped.
+fn format_run_time(secs: i64) -> String {
+    if secs < 3600 {
+        format!("{:02}:{:02}", secs / 60, secs % 60)
+    } else {
+        format!("{:02}:{:02}", secs / 3600, secs % 3600 / 60)
+    }
+}
+
 fn format_tasks(tasks: &[Value], color: bool) -> Vec<String> {
     if tasks.is_empty() {
         return Vec::new();
@@ -186,6 +195,7 @@ fn format_tasks(tasks: &[Value], color: bool) -> Vec<String> {
         ("loop_name", "loop"),
         ("step", "step"),
         ("cost", "cost"),
+        ("run_secs", "time"),
         ("short_description", "desc"),
     ];
 
@@ -198,6 +208,7 @@ fn format_tasks(tasks: &[Value], color: bool) -> Vec<String> {
             ("cost", "new") => "$0".to_string(),
             ("loop_name", _) => format!("{} ({})", s(t, "loop_name"), t["iteration"].as_i64().unwrap_or(0)),
             ("cost", _) => format!("${:.4}", t["cost"].as_f64().unwrap_or(0.0)),
+            ("run_secs", _) => format_run_time(t["run_secs"].as_i64().unwrap_or(0)),
             _ => s(t, k),
         };
         match (k, waiting_review(t), iteration_limit(t)) {
@@ -412,7 +423,7 @@ mod tests {
         ];
         let lines = format_tasks(&tasks, false);
         assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0], "id  status   path  issue   loop           step         cost     desc       ");
+        assert_eq!(lines[0], "id  status   path  issue   loop           step         cost     time   desc       ");
         let header = &lines[0];
         let row1 = &lines[1];
         let row2 = &lines[2];
@@ -449,8 +460,29 @@ mod tests {
         ];
         let lines = format_tasks(&tasks, false);
         assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0], "id  status  path  issue  loop  step  cost  desc ");
+        assert_eq!(lines[0], "id  status  path  issue  loop  step  cost  time   desc ");
         assert_eq!(lines[2], "    ! needs attention");
+    }
+
+    #[test]
+    fn format_run_time_uses_minutes_then_hours() {
+        assert_eq!(format_run_time(0), "00:00");
+        assert_eq!(format_run_time(754), "12:34");
+        assert_eq!(format_run_time(3599), "59:59");
+        assert_eq!(format_run_time(3723), "01:02");
+        assert_eq!(format_run_time(400 * 3600), "400:00");
+    }
+
+    #[test]
+    fn format_tasks_shows_zero_time_for_new_task() {
+        let tasks = vec![json!({
+            "id": "1", "status": "new", "path": "/a", "issue": null,
+            "loop_name": "definition", "step": "research", "iteration": 1,
+            "cost": 0.0, "run_secs": 0, "short_description": "First"
+        })];
+        let lines = format_tasks(&tasks, false);
+        let col = lines[0].find("time").unwrap();
+        assert_eq!(&lines[1][col..col + 5], "00:00");
     }
 
     #[test]
