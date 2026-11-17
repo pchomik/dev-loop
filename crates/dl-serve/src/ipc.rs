@@ -103,7 +103,7 @@ mod tests {
         db.insert(&mut t).unwrap();
         db.claim(&t.id, &["new"]).unwrap();
         assert_eq!(dispatch(&p, &json!({ "cmd": "abort", "id": t.id })).unwrap(), json!({ "id": t.id }));
-        assert_eq!(db.get(&t.id).unwrap().status, "stopped");
+        assert_eq!(db.get(&t.id).unwrap().status, "aborted");
         fs::remove_dir_all(&p.home).unwrap();
     }
 

@@ -49,7 +49,7 @@ enum Cmd {
         #[arg(long)]
         note: Option<String>,
     },
-    /// Stop a running task. Status becomes stopped. Start resumes it.
+    /// Abort a task in any status. Status becomes aborted. Start resumes it.
     Abort { id: String },
     /// Show tasks, or one task by ID
     List {
@@ -156,7 +156,7 @@ fn status_color(status: &str) -> Option<&'static str> {
         "running" => Some("32"),
         "waiting_review" => Some("33"),
         "done" => Some("34"),
-        "error" | "failed" => Some("31"),
+        "error" | "failed" | "aborted" => Some("31"),
         "stopped" => Some("35"),
         _ => None,
     }
@@ -523,6 +523,11 @@ mod tests {
         assert!(!row[..start].contains('\x1b'));
         assert!(!row[end..].contains('\x1b'));
         assert!(!colored[2].contains('\x1b'));
+    }
+
+    #[test]
+    fn status_color_marks_aborted_red() {
+        assert_eq!(status_color("aborted"), Some("31"));
     }
 
     #[test]

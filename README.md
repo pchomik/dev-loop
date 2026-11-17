@@ -72,7 +72,7 @@ Then use the client:
     dl approve <ID>
     dl reject <ID> --note "Missing error cases"
 
-    # Stop a running task. Status becomes stopped. Start resumes it. Worktree and branch stay
+    # Abort a task in any status. Status becomes aborted. Start resumes it. Worktree and branch stay
     dl abort <ID>
 
     # Show all tasks, or one task by ID

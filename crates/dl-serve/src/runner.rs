@@ -142,7 +142,7 @@ fn describe(p: &Paths, id: &str) {
 pub fn start(p: &Paths, id: &str) -> Result<Value, String> {
     let db = db::open(&p.db())?;
     check_parallel(p, &db, &db.get(id)?)?;
-    let t = db.claim(id, &["new", "failed", "stopped"])?;
+    let t = db.claim(id, &["new", "failed", "stopped", "aborted"])?;
     spawn_run(p, t.id.clone());
     Ok(json!({ "id": t.id }))
 }
@@ -171,14 +171,12 @@ pub fn reject(p: &Paths, id: &str, note: &str) -> Result<Value, String> {
     Ok(json!({ "id": t.id }))
 }
 
-/// Stops a running task. `start` can resume it. The worktree and branch stay.
+/// Aborts a task in any status. `start` can resume it. The worktree and branch stay.
 pub fn abort(p: &Paths, id: &str) -> Result<Value, String> {
     let db = db::open(&p.db())?;
     let t = db.get(id)?;
-    // Status is set before the kill, so the run loop sees `stopped` when the step ends.
-    if !db.stop_running(&t.id)? {
-        return Err(format!("task {} is {}, not running", t.id, t.status));
-    }
+    // Status is set before the kill, so the run loop sees `aborted` when the step ends.
+    db.set_aborted(&t.id)?;
     agent::kill(&t.id);
     Ok(json!({ "id": t.id }))
 }
@@ -260,12 +258,12 @@ fn run(p: &Paths, id: &str) -> Result<(), String> {
         };
         let prompt = build_prompt(&t, &key, output_str.as_deref(), step.kind == StepKind::Review, previous.as_deref());
         let timeout = step_timeout(limit, t.loop_elapsed);
-        // Refuses to spawn when an abort set the task to `stopped` before the spawn.
+        // Refuses to spawn when an abort set the task to `aborted` before the spawn.
         let alive = || Ok(db.get(id)?.status == "running");
         let Some(out) = agent::run(&cfg, &prompt, Some(skill), &wt, id, &p.log(id), timeout, alive)? else {
             return Ok(());
         };
-        // Aborted during the step: keep the `stopped` status and do not save.
+        // Aborted during the step: keep the `aborted` status and do not save.
         if db.get(id)?.status != "running" {
             return Ok(());
         }
@@ -589,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn abort_stops_only_running_task() {
+    fn abort_sets_aborted_in_any_status() {
         let _lock = agent_lock();
         let dir = temp("abort");
         let p = Paths { home: dir.clone(), user_config: dir.join("user.toml") };
@@ -599,12 +597,14 @@ mod tests {
         fs::create_dir_all(&wt).unwrap();
         t.worktree = Some(wt.to_string_lossy().into_owned());
         db.insert(&mut t).unwrap();
-        assert!(abort(&p, &t.id).unwrap_err().contains("is new, not running"));
-        assert_eq!(db.get(&t.id).unwrap().status, "new");
-        db.claim(&t.id, &["new"]).unwrap();
         abort(&p, &t.id).unwrap();
         let got = db.get(&t.id).unwrap();
-        assert_eq!((got.status.as_str(), got.message.as_deref()), ("stopped", Some("aborted")));
+        assert_eq!((got.status.as_str(), got.message.as_deref()), ("aborted", Some("aborted")));
+        for status in ["waiting_review", "failed", "stopped", "done"] {
+            db.set_status(&t.id, status, None).unwrap();
+            abort(&p, &t.id).unwrap();
+            assert_eq!(db.get(&t.id).unwrap().status, "aborted", "from {status}");
+        }
         assert!(wt.is_dir());
         fs::remove_dir_all(dir).unwrap();
     }
@@ -647,7 +647,7 @@ mod tests {
         abort(&p, &t.id).unwrap();
         h.join().unwrap().unwrap();
         let got = db.get(&t.id).unwrap();
-        assert_eq!((got.status.as_str(), got.loop_elapsed, got.cost, got.run_secs), ("stopped", 0, 0.0, 0));
+        assert_eq!((got.status.as_str(), got.loop_elapsed, got.cost, got.run_secs), ("aborted", 0, 0.0, 0));
         fs::remove_dir_all(dir).unwrap();
     }
 
