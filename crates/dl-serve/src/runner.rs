@@ -261,16 +261,8 @@ fn run(p: &Paths, id: &str) -> Result<(), String> {
         if t.key.is_none() {
             db.set_key(id, &key)?;
         }
-        // Documents go to the markdown repo, or to the worktree when `repo` is empty.
-        let docs_root = match cfg.markdown.repo.as_str() {
-            "" => wt.clone(),
-            r if Path::new(r).is_absolute() => PathBuf::from(r),
-            r => dir.join(r),
-        };
-        let output = step
-            .output
-            .as_ref()
-            .map(|o| docs_root.join(&cfg.markdown.dir).join(&key).join(o.replace("<KEY>", &key)));
+        let docs_root = docs_root(&cfg, &dir, &wt);
+        let output = step.output.as_ref().map(|o| output_file(&cfg, &t, o));
         let skill = step
             .skill
             .as_deref()
@@ -446,6 +438,34 @@ fn key(t: &Task, prefix: &str) -> String {
         .collect()
 }
 
+/// Documents go to the markdown repo, or to the worktree when `repo` is empty.
+fn docs_root(cfg: &Config, dir: &Path, wt: &Path) -> PathBuf {
+    match cfg.markdown.repo.as_str() {
+        "" => wt.to_path_buf(),
+        r if Path::new(r).is_absolute() => PathBuf::from(r),
+        r => dir.join(r),
+    }
+}
+
+/// File a step writes. `template` is the step's `output`, with `<KEY>` replaced by the key.
+fn output_file(cfg: &Config, t: &Task, template: &str) -> PathBuf {
+    let dir = PathBuf::from(&t.path);
+    let wt = PathBuf::from(t.worktree.clone().unwrap_or_else(|| t.path.clone()));
+    let key = key(t, &cfg.task.prefix);
+    docs_root(cfg, &dir, &wt).join(&cfg.markdown.dir).join(&key).join(template.replace("<KEY>", &key))
+}
+
+/// Output file of a step, for `dl cat`. Fails for an unknown step or a step without `output`.
+pub fn output(p: &Paths, id: &str, step: &str) -> Result<Value, String> {
+    let t = db::open(&p.db())?.get(id)?;
+    let cfg = config::load(p, Some(Path::new(&t.path)))?;
+    let Some(template) = cfg.steps.get(step).and_then(|s| s.output.as_deref()) else {
+        let with_output: Vec<&str> = cfg.steps.iter().filter(|(_, s)| s.output.is_some()).map(|(n, _)| n.as_str()).collect();
+        return Err(format!("step `{step}` is not defined or has no output. Steps with output: {}", with_output.join(", ")));
+    };
+    Ok(json!({ "path": output_file(&cfg, &t, template) }))
+}
+
 fn build_prompt(t: &Task, key: &str, output: Option<&str>, review: bool, previous: Option<&str>) -> String {
     let mut s = format!("Task key: {key}\nPath: {}\n", t.path);
     if let Some(issue) = &t.issue {
@@ -541,6 +561,20 @@ mod tests {
         assert!(fs::read_to_string(&argv).unwrap().contains("Task key: TASK-1\n"));
         let log = git(&["log", "--format=%s"]);
         assert_eq!(String::from_utf8_lossy(&log.stdout), "dev-loop: frd TASK-1\ndev-loop: research TASK-1\n");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn output_returns_step_path_and_lists_steps_with_output() {
+        let dir = temp("output");
+        fs::write(dir.join("user.toml"), "[steps.a]\nskill = \"s\"\noutput = \"<KEY>-a.md\"\n[steps.b]\nskill = \"s\"\n[[loops]]\nname = \"build\"\nsteps = [\"a\", \"b\"]\n").unwrap();
+        let p = Paths { home: dir.clone(), user_config: dir.join("user.toml") };
+        let db = db::open(&p.db()).unwrap();
+        let mut t = Task::new(&dir.to_string_lossy(), Some("PROJ-1"), None, "r", "a");
+        db.insert(&mut t).unwrap();
+        assert_eq!(output(&p, &t.id, "a").unwrap(), json!({ "path": dir.join(".features/PROJ-1/PROJ-1-a.md") }));
+        let err = output(&p, &t.id, "b").unwrap_err();
+        assert!(err.starts_with("step `b` is not defined or has no output. Steps with output: a, code-review"), "{err}");
         fs::remove_dir_all(dir).unwrap();
     }
 

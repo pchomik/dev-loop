@@ -63,6 +63,7 @@ fn dispatch(p: &Paths, req: &Value) -> Result<Value, String> {
         "approve" => runner::approve(p, prefix),
         "reject" => runner::reject(p, prefix, req["note"].as_str().unwrap_or("")),
         "abort" => runner::abort(p, prefix),
+        "output" => runner::output(p, prefix, req["step"].as_str().unwrap_or("")),
         "list" | "ls" => runner::status(p, prefix),
         cmd => Err(format!("unknown command `{cmd}`")),
     }

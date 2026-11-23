@@ -65,6 +65,12 @@ enum Cmd {
         #[arg(short, long)]
         color: bool,
     },
+    /// Print the output file of a step
+    Cat {
+        id: String,
+        /// Step name, for example `review`
+        step: String,
+    },
     /// Show the agent log of a task
     Logs {
         id: String,
@@ -122,8 +128,21 @@ fn run(cmd: Cmd) -> Result<(), String> {
             }
         }
         Cmd::Logs { id, follow } => logs(&id, follow)?,
+        Cmd::Cat { id, step } => cat(&id, &step)?,
     }
     Ok(())
+}
+
+/// Prints the output file of a step. dl-serve returns the path, so the path rule stays in one place.
+fn cat(id: &str, step: &str) -> Result<(), String> {
+    let path = send(json!({ "cmd": "output", "id": id, "step": step }))?["path"].as_str().unwrap_or_default().to_string();
+    write_output(&path, &mut io::stdout().lock())
+}
+
+/// Copies the file at `path` to `out`. A read error names the path.
+fn write_output(path: &str, out: &mut impl Write) -> Result<(), String> {
+    let bytes = fs::read(path).map_err(|e| format!("{path}: {e}. The step has not run, or its worktree is gone."))?;
+    out.write_all(&bytes).map_err(|e| e.to_string())
 }
 
 fn print_tasks(tasks: &[Value], force_color: bool) {
@@ -371,6 +390,26 @@ mod tests {
     fn create_reports_unreadable_file() {
         let cmd = Cmd::Create { path: None, create_worktree: false, source: None, issue: None, request: None, file: Some("/nonexistent/req.md".into()) };
         assert!(run(cmd).unwrap_err().contains("req.md"));
+    }
+
+    #[test]
+    fn write_output_copies_file_bytes() {
+        let dir = temp("cat-ok");
+        let file = dir.join("out.md");
+        fs::write(&file, "# Result\nbody\n").unwrap();
+        let mut out = Vec::new();
+        write_output(file.to_str().unwrap(), &mut out).unwrap();
+        assert_eq!(out, b"# Result\nbody\n");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn write_output_reports_missing_file() {
+        let mut out = Vec::new();
+        let err = write_output("/nonexistent/out.md", &mut out).unwrap_err();
+        assert!(err.contains("/nonexistent/out.md"), "{err}");
+        assert!(err.contains("The step has not run"), "{err}");
+        assert!(out.is_empty());
     }
 
     #[test]
