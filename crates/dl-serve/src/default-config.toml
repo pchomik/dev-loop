@@ -50,13 +50,15 @@ skill = "qa-review"
 output = "<KEY>-qa-review.json"
 label = "in-review"
 
-# iterations = 0 or time_limit = "0" turns that limit off.
-[loops.definition]
+# Loops run in array order. Each loop lists its steps. iterations = 0 or time_limit = "0" turns that limit off.
+[[loops]]
+name = "definition"
 steps = ["research", "frd", "user-review"]
 iterations = 3
 time_limit = "1h"
 
-[loops.execution]
+[[loops]]
+name = "execution"
 steps = ["development", "code-review", "rules-review", "complexity-review", "qa-review"]
 iterations = 3
 time_limit = "1h"

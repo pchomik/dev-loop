@@ -43,7 +43,7 @@ enum Cmd {
     Start { id: String },
     /// Approve the user review step
     Approve { id: String },
-    /// Reject the user review step and restart the definition loop
+    /// Reject the user review step and restart the current loop
     Reject {
         id: String,
         #[arg(long)]

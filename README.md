@@ -147,13 +147,18 @@ Each step sets a `label`, and optionally a `skill` and an `output` file. `<KEY>`
 
 ### loops
 
-Set the steps of each loop, the iteration limit and the time limit. `iterations = 0` or `time_limit = "0"` turns that limit off. Quote the time limit: `"0"`, not `0`.
+Define any number of loops. Each `[[loops]]` entry sets a `name`, its `steps`, the iteration limit and the time limit. Loops run in the order listed. `iterations` defaults to `3` and `time_limit` to `"1h"`. `iterations = 0` or `time_limit = "0"` turns that limit off. Quote the time limit: `"0"`, not `0`. A config that sets `loops` replaces the whole default list. Step names must be unique across all loops.
 
 ```toml
-    [loops.definition]
+    [[loops]]
+    name = "definition"
     steps = ["research", "frd", "user-review"]
     iterations = 3
     time_limit = "1h"
+
+    [[loops]]
+    name = "execution"
+    steps = ["development", "code-review"]
 ```
 
 </details>

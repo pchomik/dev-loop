@@ -96,7 +96,9 @@ pub fn create(p: &Paths, req: &Value) -> Result<Value, String> {
     if create_worktree && !ix::auto_create_enabled(&cfg) {
         return Err("--create-worktree needs github.auto_create_pr or gitlab.auto_create_mr enabled".into());
     }
-    let mut task = Task::new(path, req["issue"].as_str(), source, request, &cfg.loops.definition.steps[0]);
+    let first = &cfg.loops[0];
+    let mut task = Task::new(path, req["issue"].as_str(), source, request, &first.steps[0]);
+    task.loop_name = first.name.clone();
     let db = db::open(&p.db())?;
     db.insert(&mut task)?;
     if create_worktree {
@@ -151,10 +153,20 @@ pub fn approve(p: &Paths, id: &str) -> Result<Value, String> {
     let db = db::open(&p.db())?;
     check_parallel(p, &db, &db.get(id)?)?;
     let mut t = db.claim(id, &["waiting_review"])?;
-    let cfg = config::load(p, Some(Path::new(&t.path)))?;
-    advance(&cfg, &mut t)?;
-    db.save(&t)?;
-    spawn_run(p, t.id.clone());
+    let res = config::load(p, Some(Path::new(&t.path)))
+        .and_then(|cfg| {
+            if !cfg.steps.contains_key(&t.step) {
+                return Err(format!("step `{}` is not defined", t.step));
+            }
+            advance(&cfg, &mut t)
+        })
+        .and_then(|ended| db.save(&t).map(|()| ended));
+    let ended = fail_claimed(&db, id, res)?;
+    if ended {
+        spawn_job(p, t.id.clone(), finish);
+    } else {
+        spawn_run(p, t.id.clone());
+    }
     Ok(json!({ "id": t.id }))
 }
 
@@ -162,11 +174,16 @@ pub fn reject(p: &Paths, id: &str, note: &str) -> Result<Value, String> {
     let db = db::open(&p.db())?;
     check_parallel(p, &db, &db.get(id)?)?;
     let mut t = db.claim(id, &["waiting_review"])?;
-    let cfg = config::load(p, Some(Path::new(&t.path)))?;
-    t.iteration += 1;
-    t.step = cfg.loop_named(&t.loop_name).steps[0].clone();
-    t.review_note = (!note.is_empty()).then(|| note.to_string());
-    db.save(&t)?;
+    let res = config::load(p, Some(Path::new(&t.path))).and_then(|cfg| {
+        if !cfg.steps.contains_key(&t.step) {
+            return Err(format!("step `{}` is not defined", t.step));
+        }
+        t.iteration += 1;
+        t.step = cfg.loop_named(&t.loop_name)?.steps[0].clone();
+        t.review_note = (!note.is_empty()).then(|| note.to_string());
+        db.save(&t)
+    });
+    fail_claimed(&db, id, res)?;
     spawn_run(p, t.id.clone());
     Ok(json!({ "id": t.id }))
 }
@@ -186,10 +203,22 @@ pub fn status(p: &Paths, prefix: &str) -> Result<Value, String> {
     serde_json::to_value(tasks).map_err(|e| e.to_string())
 }
 
+/// Fails a claimed task when its post-claim work errors. Otherwise the task stays `running`.
+fn fail_claimed<T>(db: &Db, id: &str, res: Result<T, String>) -> Result<T, String> {
+    if let Err(e) = &res {
+        let _ = db.set_status(id, "failed", Some(e));
+    }
+    res
+}
+
 fn spawn_run(p: &Paths, id: String) {
+    spawn_job(p, id, run);
+}
+
+fn spawn_job(p: &Paths, id: String, job: fn(&Paths, &str) -> Result<(), String>) {
     let p = p.clone();
     thread::spawn(move || {
-        if let Err(e) = run(&p, &id) {
+        if let Err(e) = job(&p, &id) {
             eprintln!("dl-serve: task {id}: {e}");
             if let Ok(db) = db::open(&p.db()) {
                 let _ = db.set_status(&id, "failed", Some(&e));
@@ -208,7 +237,7 @@ fn run(p: &Paths, id: &str) -> Result<(), String> {
         }
         let dir = PathBuf::from(&t.path);
         let cfg = config::load(p, Some(&dir))?;
-        let lp = cfg.loop_named(&t.loop_name).clone();
+        let lp = cfg.loop_named(&t.loop_name)?.clone();
         let step = cfg
             .steps
             .get(&t.step)
@@ -303,28 +332,39 @@ fn run(p: &Paths, id: &str) -> Result<(), String> {
             }
         }
         if advance(&cfg, &mut t)? {
-            let mut notes = Vec::new();
-            if let Err(e) = ix::create_pr(&cfg, &wt) {
-                notes.push(format!("PR/MR creation failed: {e}"));
-            }
-            if let Some(w) = &t.worktree {
-                // Remove only a pushed branch. Otherwise its commits exist only in the worktree.
-                if notes.is_empty() && ix::auto_create_enabled(&cfg) {
-                    if let Err(e) = ix::remove_worktree(&dir, Path::new(w), &branch(id)) {
-                        notes.push(format!("worktree removal failed: {e}"));
-                    }
-                } else {
-                    notes.push("worktree kept: PR/MR not created".into());
-                }
-            }
-            let status = if notes.is_empty() { "done" } else { "error" };
-            let msg = (!notes.is_empty()).then(|| notes.join("; "));
-            db.set_status(id, status, msg.as_deref())?;
-            ix::notify(&cfg, &format!("{status}: {}", t.label()));
-            return Ok(());
+            db.save(&t)?;
+            return finish(p, id);
         }
         db.save(&t)?;
     }
+}
+
+/// Ends a task whose last step is done: creates the PR or MR and removes the worktree when safe.
+fn finish(p: &Paths, id: &str) -> Result<(), String> {
+    let db = db::open(&p.db())?;
+    let t = db.get(id)?;
+    let dir = PathBuf::from(&t.path);
+    let cfg = config::load(p, Some(&dir))?;
+    let wt = PathBuf::from(t.worktree.clone().unwrap_or_else(|| t.path.clone()));
+    let mut notes = Vec::new();
+    if let Err(e) = ix::create_pr(&cfg, &wt) {
+        notes.push(format!("PR/MR creation failed: {e}"));
+    }
+    if let Some(w) = &t.worktree {
+        // Remove only a pushed branch. Otherwise its commits exist only in the worktree.
+        if notes.is_empty() && ix::auto_create_enabled(&cfg) {
+            if let Err(e) = ix::remove_worktree(&dir, Path::new(w), &branch(id)) {
+                notes.push(format!("worktree removal failed: {e}"));
+            }
+        } else {
+            notes.push("worktree kept: PR/MR not created".into());
+        }
+    }
+    let status = if notes.is_empty() { "done" } else { "error" };
+    let msg = (!notes.is_empty()).then(|| notes.join("; "));
+    db.set_status(id, status, msg.as_deref())?;
+    ix::notify(&cfg, &format!("{status}: {}", t.label()));
+    Ok(())
 }
 
 /// Halt message when a loop limit is reached, else None. `0` means no limit.
@@ -359,25 +399,26 @@ fn check_parallel(p: &Paths, db: &Db, t: &Task) -> Result<(), String> {
     Err(format!("another task runs in {}; enable github.auto_create_pr or gitlab.auto_create_mr", t.path))
 }
 
-/// Moves to the next step. Returns true when the last execution step ends.
+/// Moves to the next step, or to the first step of the next loop. Returns true when the last step of the last loop ends.
 fn advance(cfg: &Config, t: &mut Task) -> Result<bool, String> {
-    let steps = &cfg.loop_named(&t.loop_name).steps;
-    let idx = steps
+    let lp = cfg.loop_named(&t.loop_name)?;
+    let idx = lp
+        .steps
         .iter()
         .position(|s| *s == t.step)
         .ok_or_else(|| format!("step `{}` is not in loop `{}`", t.step, t.loop_name))?;
-    if let Some(next) = steps.get(idx + 1) {
+    if let Some(next) = lp.steps.get(idx + 1) {
         t.step = next.clone();
         return Ok(false);
     }
-    if t.loop_name == "definition" {
-        t.loop_name = "execution".into();
-        t.step = cfg.loops.execution.steps[0].clone();
-        t.iteration = 1;
-        t.loop_elapsed = 0;
-        return Ok(false);
-    }
-    Ok(true)
+    let Some(next) = cfg.loops.iter().position(|l| l.name == lp.name).and_then(|i| cfg.loops.get(i + 1)) else {
+        return Ok(true);
+    };
+    t.loop_name = next.name.clone();
+    t.step = next.steps[0].clone();
+    t.iteration = 1;
+    t.loop_elapsed = 0;
+    Ok(false)
 }
 
 fn halt(db: &Db, cfg: &Config, t: &Task, status: &str, msg: &str) -> Result<(), String> {
@@ -529,6 +570,83 @@ mod tests {
     }
 
     #[test]
+    fn advance_runs_custom_loops_in_array_order_and_fails_removed_loop() {
+        let paths = Paths { home: env::temp_dir(), user_config: PathBuf::from("/nonexistent/dl.toml") };
+        let user = "[steps.a]\nskill = \"s\"\n[steps.b]\nskill = \"s\"\n[steps.c]\nskill = \"s\"\n[[loops]]\nname = \"zeta\"\nsteps = [\"a\", \"b\"]\n[[loops]]\nname = \"alpha\"\nsteps = [\"c\"]\niterations = 5\n";
+        let dir = temp("custom-advance");
+        fs::write(dir.join("user.toml"), user).unwrap();
+        let cfg = config::load(&Paths { user_config: dir.join("user.toml"), ..paths }, None).unwrap();
+        let mut t = Task::new("p", None, None, "r", "a");
+        t.loop_name = "zeta".into();
+        t.iteration = 2;
+        assert!(!advance(&cfg, &mut t).unwrap());
+        assert_eq!((t.loop_name.as_str(), t.step.as_str()), ("zeta", "b"));
+        assert!(!advance(&cfg, &mut t).unwrap());
+        assert_eq!((t.loop_name.as_str(), t.step.as_str(), t.iteration), ("alpha", "c", 1));
+        assert!(advance(&cfg, &mut t).unwrap());
+        t.loop_name = "removed".into();
+        assert!(advance(&cfg, &mut t).unwrap_err().contains("loop `removed` is not defined"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn approve_and_reject_fail_task_when_its_loop_is_removed() {
+        let dir = temp("removed-loop-review");
+        let p = Paths { home: dir.clone(), user_config: dir.join("user.toml") };
+        let db = db::open(&p.db()).unwrap();
+        for approve_it in [true, false] {
+            let mut t = Task::new(&dir.to_string_lossy(), None, None, "r", "user-review");
+            t.status = "waiting_review".into();
+            t.loop_name = "removed".into();
+            db.insert(&mut t).unwrap();
+            let res = if approve_it { approve(&p, &t.id) } else { reject(&p, &t.id, "") };
+            assert!(res.unwrap_err().contains("loop `removed` is not defined"));
+            let got = db.get(&t.id).unwrap();
+            assert_eq!(got.status, "failed");
+            assert!(got.message.unwrap().contains("loop `removed` is not defined"));
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn approve_fails_task_when_its_review_step_is_removed() {
+        let dir = temp("removed-step-approve");
+        // The task waits at `hold`, which the user config no longer defines.
+        fs::write(dir.join("user.toml"), "[steps.dev]\nskill = \"s\"\n[[loops]]\nname = \"build\"\nsteps = [\"dev\"]\n").unwrap();
+        let p = Paths { home: dir.clone(), user_config: dir.join("user.toml") };
+        let db = db::open(&p.db()).unwrap();
+        let mut t = Task::new(&dir.to_string_lossy(), None, None, "r", "hold");
+        t.loop_name = "build".into();
+        t.status = "waiting_review".into();
+        db.insert(&mut t).unwrap();
+        let err = approve(&p, &t.id).unwrap_err();
+        assert!(err.contains("step `hold` is not defined"), "{err}");
+        let got = db.get(&t.id).unwrap();
+        assert_eq!((got.status.as_str(), got.step.as_str()), ("failed", "hold"));
+        assert!(got.message.unwrap().contains("step `hold` is not defined"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reject_fails_task_when_its_review_step_is_removed() {
+        let dir = temp("removed-step-reject");
+        // The task waits at `hold`, which the user config no longer defines.
+        fs::write(dir.join("user.toml"), "[steps.dev]\nskill = \"s\"\n[[loops]]\nname = \"build\"\nsteps = [\"dev\"]\n").unwrap();
+        let p = Paths { home: dir.clone(), user_config: dir.join("user.toml") };
+        let db = db::open(&p.db()).unwrap();
+        let mut t = Task::new(&dir.to_string_lossy(), None, None, "r", "hold");
+        t.loop_name = "build".into();
+        t.status = "waiting_review".into();
+        db.insert(&mut t).unwrap();
+        let err = reject(&p, &t.id, "").unwrap_err();
+        assert!(err.contains("step `hold` is not defined"), "{err}");
+        let got = db.get(&t.id).unwrap();
+        assert_eq!((got.status.as_str(), got.step.as_str()), ("failed", "hold"));
+        assert!(got.message.unwrap().contains("step `hold` is not defined"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn advance_rejects_step_outside_loop() {
         let mut t = Task::new("p", None, None, "r", "development");
         assert!(advance(&defaults(), &mut t).is_err());
@@ -611,7 +729,7 @@ mod tests {
 
     #[test]
     fn zero_limits_do_not_halt_and_set_no_timeout() {
-        let lp = |iterations, time_limit: &str| Loop { steps: vec![], iterations, time_limit: time_limit.into() };
+        let lp = |iterations, time_limit: &str| Loop { name: "x".into(), steps: vec![], iterations, time_limit: time_limit.into() };
         let mut t = Task::new("p", None, None, "r", "research");
         t.iteration = 99;
         t.loop_elapsed = 99_999;
@@ -692,6 +810,104 @@ mod tests {
         assert_eq!(got.cost, 0.5);
         assert!(got.loop_elapsed > 0);
         assert_eq!(got.run_secs, got.loop_elapsed);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Polls until the task leaves `running`. Returns the task, or panics after 10 seconds.
+    fn wait_not_running(db: &Db, id: &str) -> Task {
+        for _ in 0..200 {
+            let t = db.get(id).unwrap();
+            if t.status != "running" {
+                return t;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("task {id} still running");
+    }
+
+    #[test]
+    fn approve_last_step_of_last_loop_marks_done() {
+        let dir = temp("approve-last");
+        let p = Paths { home: dir.clone(), user_config: dir.join("user.toml") };
+        let db = db::open(&p.db()).unwrap();
+        let mut t = Task::new(&dir.to_string_lossy(), None, None, "r", "qa-review");
+        t.loop_name = "execution".into();
+        t.status = "waiting_review".into();
+        db.insert(&mut t).unwrap();
+        approve(&p, &t.id).unwrap();
+        let got = wait_not_running(&db, &t.id);
+        assert_eq!((got.status.as_str(), got.message), ("done", None));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn blocking_review_and_reject_restart_loop_at_first_step() {
+        use crate::agent::tests::script;
+        let _lock = agent_lock();
+        let dir = temp("restart");
+        // The review writes one blocker finding. The loop allows one iteration, so the next pass halts.
+        let bin = script(
+            "restart",
+            r#"mkdir -p .features/REV-1 && echo '{"findings":[{"id":"1","severity":"blocker","problem":"p","fix":"f","status":"open"}]}' > .features/REV-1/REV-1-rev.json; echo '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"x"}]}}'"#,
+        );
+        let toml = format!(
+            "[agent]\nkind = \"pi\"\npi_path = \"{bin}\"\n[steps.dev]\nskill = \"s\"\n[steps.rev]\nkind = \"review\"\nskill = \"s\"\noutput = \"<KEY>-rev.json\"\n[steps.hold]\nkind = \"user-review\"\n[[loops]]\nname = \"build\"\nsteps = [\"dev\", \"rev\"]\niterations = 1\n"
+        );
+        fs::write(dir.join("user.toml"), toml).unwrap();
+        let p = Paths { home: dir.clone(), user_config: dir.join("user.toml") };
+        let db = db::open(&p.db()).unwrap();
+
+        // Blocking review: restarts at `dev` and counts the iteration, then the iteration limit halts.
+        let mut t = Task::new(&dir.to_string_lossy(), Some("REV-1"), None, "r", "rev");
+        t.loop_name = "build".into();
+        t.iteration = 1;
+        db.insert(&mut t).unwrap();
+        db.claim(&t.id, &["new"]).unwrap();
+        run(&p, &t.id).unwrap();
+        let got = db.get(&t.id).unwrap();
+        assert_eq!((got.status.as_str(), got.step.as_str(), got.iteration), ("stopped", "dev", 2));
+
+        // Reject: restarts at `hold` (the loop's first step) and counts the iteration.
+        let toml = format!(
+            "[agent]\nkind = \"pi\"\npi_path = \"{bin}\"\n[steps.dev]\nskill = \"s\"\n[steps.rev]\nkind = \"review\"\nskill = \"s\"\noutput = \"<KEY>-rev.json\"\n[steps.hold]\nkind = \"user-review\"\n[[loops]]\nname = \"build\"\nsteps = [\"hold\", \"rev\"]\niterations = 1\n"
+        );
+        fs::write(dir.join("user.toml"), toml).unwrap();
+        let mut t = Task::new(&dir.to_string_lossy(), None, None, "r", "rev");
+        t.loop_name = "build".into();
+        t.status = "waiting_review".into();
+        t.iteration = 1;
+        db.insert(&mut t).unwrap();
+        reject(&p, &t.id, "").unwrap();
+        let got = wait_not_running(&db, &t.id);
+        assert_eq!((got.status.as_str(), got.step.as_str(), got.iteration), ("waiting_review", "hold", 2));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn run_stops_at_user_review_in_custom_loop() {
+        use crate::agent::tests::script;
+        let _lock = agent_lock();
+        let dir = temp("user-review-mid");
+        let calls = dir.join("calls.txt");
+        // Records each agent call. The user review must add none.
+        let bin = script(
+            "user-review-mid",
+            &format!(r#"echo x >> {}; echo '{{"type":"message_end","message":{{"role":"assistant","content":[{{"type":"text","text":"x"}}]}}}}'"#, calls.display()),
+        );
+        let toml = format!(
+            "[agent]\nkind = \"pi\"\npi_path = \"{bin}\"\n[steps.dev]\nskill = \"s\"\n[steps.hold]\nkind = \"user-review\"\n[[loops]]\nname = \"build\"\nsteps = [\"dev\", \"hold\"]\n"
+        );
+        fs::write(dir.join("user.toml"), toml).unwrap();
+        let p = Paths { home: dir.clone(), user_config: dir.join("user.toml") };
+        let db = db::open(&p.db()).unwrap();
+        let mut t = Task::new(&dir.to_string_lossy(), None, None, "r", "dev");
+        t.loop_name = "build".into();
+        db.insert(&mut t).unwrap();
+        db.claim(&t.id, &["new"]).unwrap();
+        run(&p, &t.id).unwrap();
+        let got = db.get(&t.id).unwrap();
+        assert_eq!((got.status.as_str(), got.step.as_str()), ("waiting_review", "hold"));
+        assert_eq!(fs::read_to_string(&calls).unwrap().lines().count(), 1);
         fs::remove_dir_all(dir).unwrap();
     }
 
