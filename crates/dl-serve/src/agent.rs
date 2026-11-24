@@ -34,6 +34,14 @@ struct Parsed {
     error: Option<String>,
 }
 
+fn trim_non_empty(s: Option<&str>) -> Option<&str> {
+    s.map(str::trim).filter(|s| !s.is_empty())
+}
+
+fn resolve_model<'a>(step_model: Option<&'a str>, agent_model: Option<&'a str>) -> Option<&'a str> {
+    trim_non_empty(step_model).or_else(|| trim_non_empty(agent_model))
+}
+
 /// Runs one agent turn in `cwd` for task `id`. Process group is killed at `timeout` or by `kill`.
 /// Prompt, agent text and failure stderr go to the task log at `log_path`.
 /// `alive` is checked under the registry lock before spawn. Returns `None` without spawn when it is false.
@@ -42,6 +50,7 @@ pub fn run(
     cfg: &Config,
     prompt: &str,
     skill: Option<&str>,
+    model: Option<&str>,
     cwd: &Path,
     id: &str,
     log_path: &Path,
@@ -70,8 +79,11 @@ pub fn run(
             )
         }
     };
-    // Extra args go after the fixed flags and before the prompt.
+    // Extra args go after the fixed flags and before `--model` and the prompt.
     args.extend(extra.iter().cloned());
+    if let Some(m) = resolve_model(model, cfg.agent.model.as_deref()) {
+        args.push(format!("--model={m}"));
+    }
     args.push(msg);
 
     let mut log = Log::open(log_path)?;
@@ -279,7 +291,7 @@ pub(crate) mod tests {
             "ok",
             r#"echo '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"cost":{"total":0.5}}}}'"#,
         );
-        let out = run(&cfg(AgentKind::Pi, &bin), "p", None, &env::temp_dir(), "t", &log_file(), Duration::from_secs(10), || Ok(true)).unwrap().unwrap();
+        let out = run(&cfg(AgentKind::Pi, &bin), "p", None, None, &env::temp_dir(), "t", &log_file(), Duration::from_secs(10), || Ok(true)).unwrap().unwrap();
         assert!(out.ok());
         assert_eq!(out.text, "hi");
         assert_eq!(out.cost, 0.5);
@@ -293,7 +305,7 @@ pub(crate) mod tests {
         );
         let path = env::temp_dir().join(format!("dl-agent-log-{}.log", process::id()));
         let _ = fs::remove_file(&path);
-        run(&cfg(AgentKind::Pi, &bin), "PROMPT", Some("skill-x"), &env::temp_dir(), "t", &path, Duration::from_secs(10), || Ok(true)).unwrap().unwrap();
+        run(&cfg(AgentKind::Pi, &bin), "PROMPT", Some("skill-x"), None, &env::temp_dir(), "t", &path, Duration::from_secs(10), || Ok(true)).unwrap().unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "=== skill-x ===\nPROMPT\nHello!\n");
         fs::remove_file(path).unwrap();
     }
@@ -301,7 +313,7 @@ pub(crate) mod tests {
     #[test]
     fn run_kills_agent_at_timeout() {
         let bin = script("slow", "sleep 5");
-        let out = run(&cfg(AgentKind::Pi, &bin), "p", None, &env::temp_dir(), "t", &log_file(), Duration::from_secs(1), || Ok(true)).unwrap().unwrap();
+        let out = run(&cfg(AgentKind::Pi, &bin), "p", None, None, &env::temp_dir(), "t", &log_file(), Duration::from_secs(1), || Ok(true)).unwrap().unwrap();
         assert!(out.timed_out);
         assert!(!out.ok());
         assert!(out.secs < 5);
@@ -311,7 +323,7 @@ pub(crate) mod tests {
     fn kill_stops_running_agent_before_timeout() {
         let bin = script("kill", "sleep 30");
         let c = cfg(AgentKind::Pi, &bin);
-        let h = thread::spawn(move || run(&c, "p", None, &env::temp_dir(), "k", &log_file(), Duration::from_secs(60), || Ok(true)).unwrap().unwrap());
+        let h = thread::spawn(move || run(&c, "p", None, None, &env::temp_dir(), "k", &log_file(), Duration::from_secs(60), || Ok(true)).unwrap().unwrap());
         thread::sleep(Duration::from_millis(300));
         kill("k");
         let out = h.join().unwrap();
@@ -325,7 +337,7 @@ pub(crate) mod tests {
         let bin = script("argv", &format!("printf '%s\\n' \"$@\" > {}", out_file.display()));
         let mut c = cfg(AgentKind::Pi, &bin);
         c.agent.pi_args = vec!["--trust".into()];
-        run(&c, "p", None, &env::temp_dir(), "t", &log_file(), Duration::from_secs(10), || Ok(true)).unwrap().unwrap();
+        run(&c, "p", None, None, &env::temp_dir(), "t", &log_file(), Duration::from_secs(10), || Ok(true)).unwrap().unwrap();
         assert_eq!(fs::read_to_string(&out_file).unwrap(), "--mode\njson\n--no-session\n--trust\np\n");
         fs::remove_file(out_file).unwrap();
     }
@@ -334,7 +346,7 @@ pub(crate) mod tests {
     fn run_argv_is_unchanged_when_extra_args_empty() {
         let out_file = env::temp_dir().join(format!("dl-agent-{}-empty-argv.txt", process::id()));
         let bin = script("empty-argv", &format!("printf '%s\\n' \"$@\" > {}", out_file.display()));
-        run(&cfg(AgentKind::Pi, &bin), "p", None, &env::temp_dir(), "t", &log_file(), Duration::from_secs(10), || Ok(true)).unwrap().unwrap();
+        run(&cfg(AgentKind::Pi, &bin), "p", None, None, &env::temp_dir(), "t", &log_file(), Duration::from_secs(10), || Ok(true)).unwrap().unwrap();
         assert_eq!(fs::read_to_string(&out_file).unwrap(), "--mode\njson\n--no-session\np\n");
         fs::remove_file(out_file).unwrap();
     }
@@ -345,7 +357,7 @@ pub(crate) mod tests {
         let bin = script("cursor-argv", &format!("printf '%s\\n' \"$@\" > {}", out_file.display()));
         let mut c = cfg(AgentKind::Cursor, &bin);
         c.agent.cursor_args = vec!["--trust".into()];
-        run(&c, "p", None, &env::temp_dir(), "t", &log_file(), Duration::from_secs(10), || Ok(true)).unwrap().unwrap();
+        run(&c, "p", None, None, &env::temp_dir(), "t", &log_file(), Duration::from_secs(10), || Ok(true)).unwrap().unwrap();
         assert_eq!(fs::read_to_string(&out_file).unwrap(), "-p\n--output-format\nstream-json\n--force\n--trust\np\n");
         fs::remove_file(out_file).unwrap();
     }
@@ -355,7 +367,7 @@ pub(crate) mod tests {
         let marker = env::temp_dir().join(format!("dl-agent-{}-marker", process::id()));
         let _ = fs::remove_file(&marker);
         let bin = script("refuse", &format!("touch {}", marker.display()));
-        let out = run(&cfg(AgentKind::Pi, &bin), "p", None, &env::temp_dir(), "t", &log_file(), Duration::from_secs(10), || Ok(false)).unwrap();
+        let out = run(&cfg(AgentKind::Pi, &bin), "p", None, None, &env::temp_dir(), "t", &log_file(), Duration::from_secs(10), || Ok(false)).unwrap();
         assert!(out.is_none());
         assert!(!marker.exists());
     }
@@ -363,13 +375,45 @@ pub(crate) mod tests {
     #[test]
     fn run_reports_stderr_on_failed_exit() {
         let bin = script("fail", "echo oops >&2; exit 3");
-        let out = run(&cfg(AgentKind::Pi, &bin), "p", None, &env::temp_dir(), "t", &log_file(), Duration::from_secs(10), || Ok(true)).unwrap().unwrap();
+        let out = run(&cfg(AgentKind::Pi, &bin), "p", None, None, &env::temp_dir(), "t", &log_file(), Duration::from_secs(10), || Ok(true)).unwrap().unwrap();
         assert_eq!(out.error.as_deref(), Some("oops"));
     }
 
     #[test]
     fn run_errors_when_binary_missing() {
-        let r = run(&cfg(AgentKind::Pi, "/nonexistent/pi"), "p", None, &env::temp_dir(), "t", &log_file(), Duration::from_secs(1), || Ok(true));
+        let r = run(&cfg(AgentKind::Pi, "/nonexistent/pi"), "p", None, None, &env::temp_dir(), "t", &log_file(), Duration::from_secs(1), || Ok(true));
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn run_places_model_after_extra_args_and_before_prompt() {
+        let out_file = env::temp_dir().join(format!("dl-agent-{}-model-argv.txt", process::id()));
+        let bin = script("model-argv", &format!("printf '%s\\n' \"$@\" > {}", out_file.display()));
+
+        let mut pi_cfg = cfg(AgentKind::Pi, &bin);
+        pi_cfg.agent.pi_args = vec!["--trust".into(), "--model=base".into()];
+        pi_cfg.agent.model = Some("sonnet".into());
+        run(&pi_cfg, "p", None, Some(" opus "), &env::temp_dir(), "t", &log_file(), Duration::from_secs(10), || Ok(true)).unwrap().unwrap();
+        assert_eq!(
+            fs::read_to_string(&out_file).unwrap(),
+            "--mode\njson\n--no-session\n--trust\n--model=base\n--model=opus\np\n"
+        );
+
+        let mut cursor_cfg = cfg(AgentKind::Cursor, &bin);
+        cursor_cfg.agent.cursor_args = vec!["--trust".into()];
+        cursor_cfg.agent.model = Some(" gpt-5 ".into());
+        run(&cursor_cfg, "p", None, Some("   "), &env::temp_dir(), "t", &log_file(), Duration::from_secs(10), || Ok(true)).unwrap().unwrap();
+        assert_eq!(
+            fs::read_to_string(&out_file).unwrap(),
+            "-p\n--output-format\nstream-json\n--force\n--trust\n--model=gpt-5\np\n"
+        );
+
+        cursor_cfg.agent.model = Some("".into());
+        run(&cursor_cfg, "p", None, None, &env::temp_dir(), "t", &log_file(), Duration::from_secs(10), || Ok(true)).unwrap().unwrap();
+        assert_eq!(
+            fs::read_to_string(&out_file).unwrap(),
+            "-p\n--output-format\nstream-json\n--force\n--trust\np\n"
+        );
+        fs::remove_file(out_file).unwrap();
     }
 }

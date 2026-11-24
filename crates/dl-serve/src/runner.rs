@@ -127,7 +127,7 @@ fn describe(p: &Paths, id: &str) {
             "Write a short description of this development task in at most 8 words. Do not use tools. Reply with only the description.\n\nRequest:\n{}",
             t.request
         );
-        let Some(out) = agent::run(&cfg, &prompt, None, &dir, id, &p.log(id), Duration::from_secs(300), || Ok(true))? else {
+        let Some(out) = agent::run(&cfg, &prompt, None, None, &dir, id, &p.log(id), Duration::from_secs(300), || Ok(true))? else {
             return Ok(());
         };
         db.add_cost(id, out.cost)?;
@@ -262,7 +262,8 @@ fn run(p: &Paths, id: &str) -> Result<(), String> {
             db.set_key(id, &key)?;
         }
         let docs_root = docs_root(&cfg, &dir, &wt);
-        let output = step.output.as_ref().map(|o| output_file(&cfg, &t, o));
+        let json_routed = step.output.as_deref().is_some_and(|o| is_json_routed(&cfg, o));
+        let output = step.output.as_ref().map(|o| output_file(p, &cfg, &t, o));
         let skill = step
             .skill
             .as_deref()
@@ -277,11 +278,18 @@ fn run(p: &Paths, id: &str) -> Result<(), String> {
             }
             _ => None,
         };
-        let prompt = build_prompt(&t, &key, output_str.as_deref(), step.kind == StepKind::Review, previous.as_deref());
+        let prompt = build_prompt(
+            &t,
+            &key,
+            output_str.as_deref(),
+            step.kind == StepKind::Review,
+            previous.as_deref(),
+            &cfg.markdown.user_name,
+        );
         let timeout = step_timeout(limit, t.loop_elapsed);
         // Refuses to spawn when an abort set the task to `aborted` before the spawn.
         let alive = || Ok(db.get(id)?.status == "running");
-        let Some(out) = agent::run(&cfg, &prompt, Some(skill), &wt, id, &p.log(id), timeout, alive)? else {
+        let Some(out) = agent::run(&cfg, &prompt, Some(skill), step.model.as_deref(), &wt, id, &p.log(id), timeout, alive)? else {
             return Ok(());
         };
         // Aborted during the step: keep the `aborted` status and do not save.
@@ -304,7 +312,7 @@ fn run(p: &Paths, id: &str) -> Result<(), String> {
                 let msg = format!("step `{}` did not create {}", t.step, file.display());
                 return halt(&db, &cfg, &t, "failed", &msg);
             }
-            if cfg.markdown.auto_commit {
+            if cfg.markdown.auto_commit && !json_routed {
                 ix::commit(&docs_root, file, &format!("dev-loop: {} {key}", t.step), cfg.markdown.auto_push)?;
             }
         }
@@ -438,21 +446,45 @@ fn key(t: &Task, prefix: &str) -> String {
         .collect()
 }
 
+fn expand_home_with(s: &str, home: Option<&str>) -> PathBuf {
+    if let Some(rest) = s.strip_prefix("~/") {
+        let base = home.unwrap_or(".");
+        return PathBuf::from(base).join(rest);
+    }
+    PathBuf::from(s)
+}
+
+fn expand_home(s: &str) -> PathBuf {
+    expand_home_with(s, std::env::var("HOME").ok().as_deref())
+}
+
+fn is_json_routed(cfg: &Config, template: &str) -> bool {
+    !cfg.json.dir.is_empty() && template.ends_with(".json")
+}
+
 /// Documents go to the markdown repo, or to the worktree when `repo` is empty.
 fn docs_root(cfg: &Config, dir: &Path, wt: &Path) -> PathBuf {
     match cfg.markdown.repo.as_str() {
         "" => wt.to_path_buf(),
-        r if Path::new(r).is_absolute() => PathBuf::from(r),
-        r => dir.join(r),
+        r => {
+            let p = expand_home(r);
+            if p.is_absolute() { p } else { dir.join(p) }
+        }
     }
 }
 
 /// File a step writes. `template` is the step's `output`, with `<KEY>` replaced by the key.
-fn output_file(cfg: &Config, t: &Task, template: &str) -> PathBuf {
+fn output_file(p: &Paths, cfg: &Config, t: &Task, template: &str) -> PathBuf {
+    let key = key(t, &cfg.task.prefix);
+    let name = template.replace("<KEY>", &key);
+    if is_json_routed(cfg, template) {
+        let base = expand_home(&cfg.json.dir);
+        let root = if base.is_absolute() { base } else { p.home.join(base) };
+        return root.join(&key).join(name);
+    }
     let dir = PathBuf::from(&t.path);
     let wt = PathBuf::from(t.worktree.clone().unwrap_or_else(|| t.path.clone()));
-    let key = key(t, &cfg.task.prefix);
-    docs_root(cfg, &dir, &wt).join(&cfg.markdown.dir).join(&key).join(template.replace("<KEY>", &key))
+    docs_root(cfg, &dir, &wt).join(&cfg.markdown.dir).join(&key).join(name)
 }
 
 /// Output file of a step, for `dl cat`. Fails for an unknown step or a step without `output`.
@@ -463,10 +495,10 @@ pub fn output(p: &Paths, id: &str, step: &str) -> Result<Value, String> {
         let with_output: Vec<&str> = cfg.steps.iter().filter(|(_, s)| s.output.is_some()).map(|(n, _)| n.as_str()).collect();
         return Err(format!("step `{step}` is not defined or has no output. Steps with output: {}", with_output.join(", ")));
     };
-    Ok(json!({ "path": output_file(&cfg, &t, template) }))
+    Ok(json!({ "path": output_file(p, &cfg, &t, template) }))
 }
 
-fn build_prompt(t: &Task, key: &str, output: Option<&str>, review: bool, previous: Option<&str>) -> String {
+fn build_prompt(t: &Task, key: &str, output: Option<&str>, review: bool, previous: Option<&str>, user_name: &str) -> String {
     let mut s = format!("Task key: {key}\nPath: {}\n", t.path);
     if let Some(issue) = &t.issue {
         s += &format!("Issue reference: {issue}\n");
@@ -477,6 +509,10 @@ fn build_prompt(t: &Task, key: &str, output: Option<&str>, review: bool, previou
     }
     if let Some(o) = output {
         s += &format!("\nWrite the output document to: {o}\n");
+    }
+    let owner = user_name.trim();
+    if !review && !owner.is_empty() {
+        s += &format!("\nDocument owner: {owner}. Use this as the document Author and default Owner.\n");
     }
     if let Some(prev) = previous {
         s += &format!("\nPrevious findings. Keep each id. Set status to `closed` when fixed, `open` when not fixed. Add new findings with new ids:\n{prev}\n");
@@ -690,7 +726,7 @@ mod tests {
     fn build_prompt_includes_request_feedback_output_and_findings() {
         let mut t = Task::new("proj", Some("PROJ-1"), None, "add login", "research");
         t.review_note = Some("fix tests".into());
-        let p = build_prompt(&t, "PROJ-1", Some("/docs/x.md"), true, Some("{\"findings\":[]}"));
+        let p = build_prompt(&t, "PROJ-1", Some("/docs/x.md"), true, Some("{\"findings\":[]}"), "Alice");
         assert!(p.contains("Task key: PROJ-1\nPath: proj\n"));
         assert!(p.contains("Issue reference: PROJ-1"));
         assert!(p.contains("Original request:\nadd login"));
@@ -698,11 +734,20 @@ mod tests {
         assert!(p.contains("Write the output document to: /docs/x.md"));
         assert!(p.contains("Write findings as JSON"));
         assert!(p.contains("Previous findings"));
+        assert!(!p.contains("Document owner:"));
+        assert!(!p.contains("Alice"));
 
-        let plain = build_prompt(&Task::new("proj", None, None, "r", "research"), "k", None, false, None);
+        let plain = build_prompt(&Task::new("proj", None, None, "r", "research"), "k", None, false, None, "");
         assert!(!plain.contains("Issue reference"));
         assert!(!plain.contains("Write findings as JSON"));
         assert!(!plain.contains("Write the output document"));
+        assert!(!plain.contains("Document owner:"));
+
+        let blank = build_prompt(&Task::new("proj", None, None, "r", "research"), "k", None, false, None, "   ");
+        assert!(!blank.contains("Document owner:"));
+
+        let owned = build_prompt(&Task::new("proj", None, None, "r", "research"), "k", None, false, None, "Alice");
+        assert!(owned.contains("Document owner: Alice. Use this as the document Author and default Owner."));
     }
 
     #[test]
@@ -958,6 +1003,127 @@ mod tests {
 
         let err = create(&p, &json!({ "path": dir.to_string_lossy(), "request": "r", "source": "slack" })).unwrap_err();
         assert!(err.contains("source must be one of"), "{err}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn json_dir_routes_json_outputs_and_skips_markdown_auto_commit() {
+        use crate::agent::tests::script;
+        let _lock = agent_lock();
+        let dir = temp("json-dir");
+        let p = Paths { home: dir.join("home"), user_config: dir.join("user.toml") };
+        fs::create_dir_all(&p.home).unwrap();
+
+        let mut cfg = defaults();
+        let t = Task::new(&dir.to_string_lossy(), Some("PROJ-1"), None, "r", "code-review");
+
+        // FR-002 / NFR-001: empty json.dir keeps .json under [markdown].
+        assert_eq!(
+            output_file(&p, &cfg, &t, "<KEY>-code-review.json"),
+            dir.join(".features/PROJ-1/PROJ-1-code-review.json")
+        );
+
+        // FR-005: expand_home_with expands ~/ and leaves other paths untouched.
+        assert_eq!(expand_home_with("~/.local/share/dev-loop/reviews", Some("/home/u")), PathBuf::from("/home/u/.local/share/dev-loop/reviews"));
+        assert_eq!(expand_home_with("reviews", Some("/home/u")), PathBuf::from("reviews"));
+
+        // FR-006 / E-003: relative json.dir resolves against Paths::home.
+        cfg.json.dir = "reviews".into();
+        assert_eq!(
+            output_file(&p, &cfg, &t, "<KEY>-code-review.json"),
+            p.home.join("reviews/PROJ-1/PROJ-1-code-review.json")
+        );
+
+        // FR-003 / FR-005 / E-002 / E-005: ~/ expands via HOME for .json and markdown.repo, .md stays under [markdown].
+        if let Ok(home) = env::var("HOME") {
+            cfg.json.dir = "~/.local/share/dev-loop/reviews".into();
+            cfg.markdown.repo = "~/uca-knowledge-base".into();
+            assert_eq!(
+                output_file(&p, &cfg, &t, "<KEY>-code-review.json"),
+                PathBuf::from(&home).join(".local/share/dev-loop/reviews/PROJ-1/PROJ-1-code-review.json")
+            );
+            assert_eq!(
+                output_file(&p, &cfg, &t, "<KEY>-frd.md"),
+                PathBuf::from(&home).join("uca-knowledge-base/.features/PROJ-1/PROJ-1-frd.md")
+            );
+        }
+
+        // FR-004 / FR-007 / E-004 / E-006: `output` matches `run` path and `auto_commit` skips `ix::commit` for .json.
+        let json_out = p.home.join("reviews/PROJ-1/PROJ-1-custom.json");
+        let bin = script(
+            "json-dir",
+            &format!(
+                r#"mkdir -p "$(dirname "{0}")" && echo '{{"ok":true}}' > "{0}"; echo '{{"type":"message_end","message":{{"role":"assistant","content":[{{"type":"text","text":"x"}}]}}}}'"#,
+                json_out.display()
+            ),
+        );
+        let toml = format!(
+            "[agent]\nkind = \"pi\"\npi_path = \"{bin}\"\n[markdown]\nauto_commit = true\n[json]\ndir = \"reviews\"\n[steps.custom]\nskill = \"s\"\noutput = \"<KEY>-custom.json\"\n[steps.hold]\nkind = \"user-review\"\n[[loops]]\nname = \"build\"\nsteps = [\"custom\", \"hold\"]\n"
+        );
+        fs::write(&p.user_config, toml).unwrap();
+        let git = |args: &[&str]| process::Command::new("git").current_dir(&dir).args(args).output().unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        fs::write(dir.join("README"), "init\n").unwrap();
+        git(&["add", "README"]);
+        git(&["commit", "-q", "-m", "init"]);
+
+        let db = db::open(&p.db()).unwrap();
+        let mut task = Task::new(&dir.to_string_lossy(), Some("PROJ-1"), None, "r", "custom");
+        task.loop_name = "build".into();
+        db.insert(&mut task).unwrap();
+        assert_eq!(output(&p, &task.id, "custom").unwrap(), json!({ "path": json_out }));
+
+        db.claim(&task.id, &["new"]).unwrap();
+        run(&p, &task.id).unwrap();
+        let got = db.get(&task.id).unwrap();
+        assert_eq!(got.status, "waiting_review");
+        assert!(json_out.is_file());
+        let log = git(&["log", "--format=%s"]);
+        assert_eq!(String::from_utf8_lossy(&log.stdout), "init\n");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn step_model_overrides_agent_model_without_leaking_and_describe_uses_agent_model() {
+        use crate::agent::tests::script;
+        let _lock = agent_lock();
+        let dir = temp("model-resolution");
+        let calls = dir.join("calls.txt");
+        let bin = script(
+            "model-resolution",
+            &format!(
+                r#"printf '%s' "$*" | tr '\n' ' ' >> {0}; echo >> {0}; echo '{{"type":"message_end","message":{{"role":"assistant","content":[{{"type":"text","text":"Short"}}]}}}}'"#,
+                calls.display()
+            ),
+        );
+        let toml = format!(
+            "[agent]\nkind = \"pi\"\npi_path = \"{bin}\"\nmodel = \"sonnet\"\n\
+             [steps.s1]\nskill = \"k1\"\nmodel = \"opus\"\n\
+             [steps.s2]\nskill = \"k2\"\nmodel = \"   \"\n\
+             [steps.hold]\nkind = \"user-review\"\nmodel = \"ignored\"\n\
+             [[loops]]\nname = \"build\"\nsteps = [\"s1\", \"s2\", \"hold\"]\n"
+        );
+        fs::write(dir.join("user.toml"), toml).unwrap();
+        let p = Paths { home: dir.clone(), user_config: dir.join("user.toml") };
+        let db = db::open(&p.db()).unwrap();
+        let mut t = Task::new(&dir.to_string_lossy(), None, None, "r", "s1");
+        t.loop_name = "build".into();
+        db.insert(&mut t).unwrap();
+
+        describe(&p, &t.id);
+        db.claim(&t.id, &["new"]).unwrap();
+        run(&p, &t.id).unwrap();
+
+        let got = db.get(&t.id).unwrap();
+        assert_eq!((got.status.as_str(), got.step.as_str()), ("waiting_review", "hold"));
+        let lines: Vec<String> = fs::read_to_string(&calls).unwrap().lines().map(str::to_string).collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("--model=sonnet "), "describe: {}", lines[0]);
+        assert!(lines[1].contains("--model=opus "), "s1: {}", lines[1]);
+        assert!(lines[2].contains("--model=sonnet "), "s2: {}", lines[2]);
+        assert!(!lines[2].contains("--model=opus"), "s2 leaked: {}", lines[2]);
         fs::remove_dir_all(dir).unwrap();
     }
 }

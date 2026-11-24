@@ -58,6 +58,7 @@ pub struct Agent {
     pub cursor_path: String,
     pub pi_args: Vec<String>,
     pub cursor_args: Vec<String>,
+    pub model: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -67,6 +68,7 @@ pub struct Step {
     pub skill: Option<String>,
     pub output: Option<String>,
     pub label: Option<String>,
+    pub model: Option<String>,
 }
 
 fn default_iterations() -> i64 {
@@ -131,8 +133,14 @@ pub struct Telegram {
 pub struct Markdown {
     pub dir: String,
     pub repo: String,
+    pub user_name: String,
     pub auto_commit: bool,
     pub auto_push: bool,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct Json {
+    pub dir: String,
 }
 
 #[derive(Deserialize, Clone)]
@@ -150,6 +158,7 @@ pub struct Config {
     pub gitlab: Gitlab,
     pub telegram: Telegram,
     pub markdown: Markdown,
+    pub json: Json,
     pub task: Task,
 }
 
@@ -167,7 +176,11 @@ pub fn load(paths: &Paths, project: Option<&Path>) -> Result<Config, String> {
     if let Some(dir) = project {
         merge(&mut t, read_table(&dir.join("dev-loop.toml"))?);
     }
-    let cfg: Config = Value::Table(t).try_into().map_err(|e| format!("config: {e}"))?;
+    let mut cfg: Config = Value::Table(t).try_into().map_err(|e| format!("config: {e}"))?;
+    cfg.agent.model = normalize_model(cfg.agent.model.take());
+    for s in cfg.steps.values_mut() {
+        s.model = normalize_model(s.model.take());
+    }
     if cfg.loops.is_empty() {
         return Err("config needs at least one loop".into());
     }
@@ -207,6 +220,13 @@ pub fn load(paths: &Paths, project: Option<&Path>) -> Result<Config, String> {
         }
     }
     Ok(cfg)
+}
+
+fn normalize_model(model: Option<String>) -> Option<String> {
+    model.and_then(|m| {
+        let trimmed = m.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
 }
 
 fn read_table(path: &Path) -> Result<Table, String> {
@@ -357,5 +377,71 @@ mod tests {
         assert_eq!(load_user("prefix-default", "").unwrap().task.prefix, "TASK-");
         let cfg = load_user("prefix-set", "[task]\nprefix = \"PROJ-\"\n").unwrap();
         assert_eq!(cfg.task.prefix, "PROJ-");
+    }
+
+    #[test]
+    fn json_dir_defaults_to_empty_and_can_be_overridden() {
+        assert_eq!(load_user("json-default", "").unwrap().json.dir, "");
+        let dir = env::temp_dir().join(format!("dl-cfg-json-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let user = dir.join("user.toml");
+        fs::write(&user, "[json]\ndir = \"~/.local/share/dev-loop/reviews\"\n").unwrap();
+        let proj = dir.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let paths = Paths { home: dir.clone(), user_config: user };
+        assert_eq!(load(&paths, Some(&proj)).unwrap().json.dir, "~/.local/share/dev-loop/reviews");
+        fs::write(proj.join("dev-loop.toml"), "[json]\ndir = \"custom-json\"\n").unwrap();
+        assert_eq!(load(&paths, Some(&proj)).unwrap().json.dir, "custom-json");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn user_name_defaults_to_empty_and_can_be_overridden() {
+        assert_eq!(load_user("user-name-default", "").unwrap().markdown.user_name, "");
+        let dir = env::temp_dir().join(format!("dl-cfg-user-name-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let user = dir.join("user.toml");
+        fs::write(&user, "[markdown]\nuser_name = \"Alice\"\n").unwrap();
+        let proj = dir.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let paths = Paths { home: dir.clone(), user_config: user };
+        assert_eq!(load(&paths, Some(&proj)).unwrap().markdown.user_name, "Alice");
+        fs::write(proj.join("dev-loop.toml"), "[markdown]\nuser_name = \"Bob\"\n").unwrap();
+        assert_eq!(load(&paths, Some(&proj)).unwrap().markdown.user_name, "Bob");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn model_defaults_to_none_and_supports_overrides_trim_and_clear() {
+        let def = load_user("model-default", "").unwrap();
+        assert_eq!(def.agent.model, None);
+        assert_eq!(def.steps["research"].model, None);
+
+        let dir = env::temp_dir().join(format!("dl-cfg-model-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let user = dir.join("user.toml");
+        fs::write(
+            &user,
+            "[agent]\nmodel = \"  sonnet  \"\n[steps.research]\nmodel = \"haiku\"\n",
+        )
+        .unwrap();
+        let proj = dir.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let paths = Paths { home: dir.clone(), user_config: user };
+
+        let cfg = load(&paths, Some(&proj)).unwrap();
+        assert_eq!(cfg.agent.model.as_deref(), Some("sonnet"));
+        assert_eq!(cfg.steps["research"].model.as_deref(), Some("haiku"));
+
+        fs::write(
+            proj.join("dev-loop.toml"),
+            "[agent]\nmodel = \"\"\n[steps.research]\nmodel = \"   \"\n[steps.frd]\nmodel = \" opus \"\n",
+        )
+        .unwrap();
+        let cfg = load(&paths, Some(&proj)).unwrap();
+        assert_eq!(cfg.agent.model, None);
+        assert_eq!(cfg.steps["research"].model, None);
+        assert_eq!(cfg.steps["frd"].model.as_deref(), Some("opus"));
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -114,9 +114,10 @@ Choose the agent and set the binary paths.
     cursor_path = "cursor-agent"
     pi_args = []             # extra args for pi, before the prompt
     cursor_args = []         # extra args for cursor-agent, before the prompt
+    model = ""               # optional default model passed as --model=<model>
 ```
 
-`pi_args` and `cursor_args` apply to every agent call. Example: `pi_args = ["--trust"]`.
+`pi_args` and `cursor_args` apply to every agent call. Example: `pi_args = ["--trust"]`. Set `model` to pass `--model=<model>` after those args.
 
 </details>
 
@@ -126,13 +127,14 @@ Choose the agent and set the binary paths.
 
 ### steps
 
-Each step sets a `label`, and optionally a `skill` and an `output` file. `<KEY>` in `output` is the issue ID, or the task ID when no issue is set.
+Each step sets a `label`, and optionally a `skill`, an `output` file, and a `model` (overrides `[agent].model`). `<KEY>` in `output` is the issue ID, or the task ID when no issue is set.
 
 ```toml
     [steps.research]
     skill = "create-research"
     output = "<KEY>-research.md"
     label = "dl:research"
+    model = ""               # optional; overrides [agent].model for this step
 
     [steps.user-review]
     kind = "user-review"     # agent | review | user-review

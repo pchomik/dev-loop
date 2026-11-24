@@ -6,6 +6,7 @@ pi_path = "pi"
 cursor_path = "cursor-agent"
 pi_args = []           # extra args before the prompt, e.g. ["--trust"]
 cursor_args = []
+model = ""             # optional default model passed as --model=<model>
 
 [steps.research]
 skill = "create-research"
@@ -84,5 +85,9 @@ prefix = "TASK-"   # key for tasks with no source and no issue: <prefix><task ID
 [markdown]
 dir = ".features"      # folder for <KEY>/ documents, relative to the repo root
 repo = ""              # empty: task worktree. Path to another git repo (relative to project dir or absolute)
+user_name = ""         # document Author and default Owner; empty keeps [Name] placeholders
 auto_commit = false
 auto_push = false
+
+[json]
+dir = ""               # empty: same as [markdown]. Path to folder for .json outputs (relative to ~/.local/share/dev-loop, ~/..., or absolute)
